@@ -1,0 +1,20 @@
+{
+  "name": "ai-bot-salesman",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI Bot Salesman for VNETWORK - monorepo",
+  "packageManager": "npm@10.9.4",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:infra": "docker compose -f infra/docker-compose.yml up -d postgres redis",
+    "dev": "npm run dev --workspace=@vnetwork/api",
+    "dev:web": "npm run dev --workspace=@vnetwork/web",
+    "dev:api": "npm run dev --workspace=@vnetwork/api",
+    "dev:worker": "npm run worker --workspace=@vnetwork/api",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  }
+}

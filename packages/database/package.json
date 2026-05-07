@@ -1,0 +1,14 @@
+{
+  "name": "@vnetwork/database",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.16.0"
+  },
+  "scripts": {
+    "migrate": "node scripts/migrate.mjs",
+    "seed": "node scripts/seed.mjs",
+    "lint": "echo 'lint not configured yet'"
+  }
+}

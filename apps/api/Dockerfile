@@ -1,0 +1,7 @@
+FROM node:22-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+RUN npm run build --workspace=@vnetwork/api
+EXPOSE 4000
+CMD ["npm", "run", "start", "--workspace=@vnetwork/api"]
