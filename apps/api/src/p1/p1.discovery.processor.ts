@@ -48,6 +48,11 @@ interface UnifiedKeyPersonCandidate {
   raw: Record<string, unknown>;
 }
 
+interface HunterVerificationSnapshot {
+  status: string | null;
+  score: number | null;
+}
+
 @Injectable()
 @Processor('p1-discovery')
 export class P1DiscoveryProcessor extends WorkerHost {
@@ -94,21 +99,14 @@ export class P1DiscoveryProcessor extends WorkerHost {
 
     try {
       const companyQuery = this.buildCompanyQuery(searchJob);
-      const companies = await this.findCompaniesWithCache(searchJobId, companyQuery, searchJob.region);
-      const prioritizedCompanies = this.buildDiscoveryCompanies(searchJob.keyword, companies).slice(0, 3);
+      const prioritizedCompanies = this.buildDiscoveryCompanies(companyQuery, []).slice(0, 3);
 
       let prospectsCreated = 0;
       let keyPersonsProcessed = 0;
 
       for (let index = 0; index < prioritizedCompanies.length; index += 1) {
         const candidate = prioritizedCompanies[index];
-
-        if (index > 0) {
-          await this.respectRateLimit('RAPIDAPI_RATE_LIMIT_PER_MINUTE', 60);
-        }
-
-        const profile = await this.getCompanyProfileWithCache(searchJobId, candidate);
-        let enrichedCandidate = this.applyCompanyProfile(candidate, profile);
+        let enrichedCandidate = candidate;
 
         await this.respectRateLimit('CRAWLER_RATE_LIMIT_PER_MINUTE', 20);
         const crawlData = await this.crawlCompanyWithCache(searchJobId, enrichedCandidate);
@@ -116,18 +114,21 @@ export class P1DiscoveryProcessor extends WorkerHost {
 
         await this.respectRateLimit('APOLLO_RATE_LIMIT_PER_MINUTE', 30);
         const apolloCompany = await this.findApolloCompanyWithCache(searchJobId, enrichedCandidate);
-        enrichedCandidate = this.applyApolloCompanyData(enrichedCandidate, apolloCompany);
+        await this.respectRateLimit('APOLLO_RATE_LIMIT_PER_MINUTE', 30);
+        const apolloOrganization = await this.enrichApolloOrganizationWithCache(
+          searchJobId,
+          enrichedCandidate.name,
+          this.normalizeDomain(apolloCompany?.domain ?? enrichedCandidate.domain ?? null)
+        );
+        const finalApolloCompany = apolloOrganization ?? apolloCompany;
+        enrichedCandidate = this.applyApolloCompanyData(enrichedCandidate, finalApolloCompany);
 
         const company = await this.upsertCompany(searchJobId, enrichedCandidate);
         const companyDomain = this.normalizeDomain(
-          company.domain ?? enrichedCandidate.domain ?? crawlData?.canonicalDomain ?? apolloCompany?.domain ?? null
+          company.domain ?? enrichedCandidate.domain ?? crawlData?.canonicalDomain ?? finalApolloCompany?.domain ?? null
         );
-        const hunterContacts = companyDomain
-          ? await (async () => {
-              await this.respectRateLimit('HUNTER_RATE_LIMIT_PER_MINUTE', 30);
-              return this.findContactsWithCache(searchJobId, companyDomain);
-            })()
-          : [];
+        await this.respectRateLimit('HUNTER_RATE_LIMIT_PER_MINUTE', 30);
+        const hunterContacts = await this.findContactsWithCache(searchJobId, companyDomain, company.name);
 
         await this.respectRateLimit('APOLLO_RATE_LIMIT_PER_MINUTE', 30);
         const apolloPeople = await this.findApolloPeopleWithCache(
@@ -138,13 +139,17 @@ export class P1DiscoveryProcessor extends WorkerHost {
         );
 
         const enrichedApolloPeople = await this.enrichApolloTopCandidates(searchJobId, companyDomain, apolloPeople);
+        const apolloPeopleWithEmails = await this.fillMissingEmailsByHunter(searchJobId, companyDomain, enrichedApolloPeople);
         const hunterCandidates = this.prioritizeKeyPersons(
           hunterContacts.map((item) => this.toUnifiedFromHunter(item))
         );
         const apolloCandidates = this.prioritizeKeyPersons(
-          enrichedApolloPeople.map((item) => this.toUnifiedFromApollo(item))
+          apolloPeopleWithEmails.map((item) => this.toUnifiedFromApollo(item))
         );
-        const keyPersons = this.composeKeyPersonsWithoutMerge(hunterCandidates, apolloCandidates).slice(0, 5);
+        const keyPersons = await this.verifyKeyPersonEmails(
+          searchJobId,
+          this.composeKeyPersonsWithoutMerge(hunterCandidates, apolloCandidates).slice(0, 5)
+        );
 
         for (const keyPerson of keyPersons) {
           const contactId = await this.upsertContact(searchJobId, company, keyPerson);
@@ -291,6 +296,18 @@ export class P1DiscoveryProcessor extends WorkerHost {
     if (cachedRows[0]) {
       const cached = cachedRows[0].raw_json as Record<string, unknown>;
       const items = Array.isArray(cached?.items) ? (cached.items as LinkedinCompanyCandidate[]) : [];
+      await this.pg.query(
+        `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          searchJobId,
+          'rapidapi-linkedin',
+          'company-search',
+          searchJobId,
+          JSON.stringify({ ...cached, cached: true }),
+          requestHash
+        ]
+      );
       return items;
     }
 
@@ -354,6 +371,11 @@ export class P1DiscoveryProcessor extends WorkerHost {
       const cached = cachedRows[0].raw_json as Record<string, unknown>;
       const profile = cached?.profile as LinkedinCompanyProfile | undefined;
       if (profile) {
+        await this.pg.query(
+          `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+          [searchJobId, 'rapidapi-linkedin', 'company-profile', key, JSON.stringify({ ...cached, cached: true }), requestHash]
+        );
         return profile;
       }
     }
@@ -396,13 +418,10 @@ export class P1DiscoveryProcessor extends WorkerHost {
     candidate: LinkedinCompanyCandidate
   ): Promise<CrawledCompanyData | null> {
     const normalizedDomain = this.normalizeDomain(candidate.domain);
-    if (!normalizedDomain) {
-      return null;
-    }
 
     const requestHash = this.hashPayload({
       companyName: candidate.name,
-      domain: normalizedDomain,
+      domain: normalizedDomain ?? null,
       linkedinUrl: candidate.linkedinUrl
     });
 
@@ -422,6 +441,11 @@ export class P1DiscoveryProcessor extends WorkerHost {
       const cached = cachedRows[0].raw_json as Record<string, unknown>;
       const crawl = cached?.crawl as CrawledCompanyData | undefined;
       if (crawl) {
+        await this.pg.query(
+          `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+          [searchJobId, 'crawler-bot', 'company-crawl', normalizedDomain ?? candidate.name, JSON.stringify({ ...cached, cached: true }), requestHash]
+        );
         return crawl;
       }
     }
@@ -461,7 +485,7 @@ export class P1DiscoveryProcessor extends WorkerHost {
         searchJobId,
         'crawler-bot',
         'company-crawl',
-        normalizedDomain,
+        normalizedDomain ?? candidate.name,
         JSON.stringify({ crawl }),
         requestHash
       ]
@@ -495,6 +519,18 @@ export class P1DiscoveryProcessor extends WorkerHost {
     if (cachedRows[0]) {
       const cached = cachedRows[0].raw_json as Record<string, unknown>;
       const item = cached?.item as ApolloCompanyCandidate | undefined;
+      await this.pg.query(
+        `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          searchJobId,
+          'apollo',
+          'company-search',
+          normalizedDomain ?? candidate.name,
+          JSON.stringify({ ...cached, cached: true }),
+          requestHash
+        ]
+      );
       if (item) {
         return item;
       }
@@ -560,6 +596,18 @@ export class P1DiscoveryProcessor extends WorkerHost {
     if (cachedRows[0]) {
       const cached = cachedRows[0].raw_json as Record<string, unknown>;
       const items = Array.isArray(cached?.items) ? (cached.items as ApolloPersonCandidate[]) : [];
+      await this.pg.query(
+        `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          searchJobId,
+          'apollo',
+          'people-search',
+          companyDomain ?? companyName,
+          JSON.stringify({ ...cached, cached: true }),
+          requestHash
+        ]
+      );
       return items;
     }
 
@@ -581,7 +629,7 @@ export class P1DiscoveryProcessor extends WorkerHost {
          latency_ms = EXCLUDED.latency_ms,
          search_job_id = EXCLUDED.search_job_id,
          created_at = now()`,
-      ['apollo', '/mixed_people/api_search', requestHash, 200, latencyMs, searchJobId]
+      ['apollo', '/mixed_people/search', requestHash, 200, latencyMs, searchJobId]
     );
 
     await this.pg.query(
@@ -652,6 +700,18 @@ export class P1DiscoveryProcessor extends WorkerHost {
       const cached = cachedRows[0].raw_json as Record<string, unknown>;
       const item = cached?.item as ApolloPersonCandidate | undefined;
       if (item) {
+        await this.pg.query(
+          `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+          [
+            searchJobId,
+            'apollo',
+            'person-enrichment',
+            `${companyDomain ?? 'unknown-domain'}:${person.fullName}`,
+            JSON.stringify({ ...cached, cached: true }),
+            requestHash
+          ]
+        );
         return item;
       }
     }
@@ -687,6 +747,231 @@ export class P1DiscoveryProcessor extends WorkerHost {
     );
 
     return enriched;
+  }
+
+  private async enrichApolloOrganizationWithCache(
+    searchJobId: string,
+    companyName: string,
+    companyDomain: string | null
+  ): Promise<ApolloCompanyCandidate | null> {
+    const requestHash = this.hashPayload({
+      companyName,
+      companyDomain: companyDomain ?? null
+    });
+
+    const cachedRows = await this.pg.query<RawSnapshotRow>(
+      `SELECT raw_json
+       FROM raw_data_snapshots
+       WHERE source = 'apollo'
+         AND entity_type = 'organization-enrich'
+         AND content_hash = $1
+         AND created_at >= now() - ($2::text || ' hours')::interval
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [requestHash, this.apolloCacheHours]
+    );
+
+    if (cachedRows[0]) {
+      const cached = cachedRows[0].raw_json as Record<string, unknown>;
+      const item = (cached?.item as ApolloCompanyCandidate | undefined) ?? null;
+      await this.pg.query(
+        `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          searchJobId,
+          'apollo',
+          'organization-enrich',
+          companyDomain ?? companyName,
+          JSON.stringify({ ...cached, cached: true }),
+          requestHash
+        ]
+      );
+      return item;
+    }
+
+    const started = Date.now();
+    const result = await this.apollo.enrichOrganization(companyName, companyDomain);
+    const latencyMs = Date.now() - started;
+
+    await this.pg.query(
+      `INSERT INTO external_api_requests (
+         provider, endpoint, request_hash, status_code, latency_ms, search_job_id
+       ) VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (provider, endpoint, request_hash)
+       DO UPDATE SET
+         status_code = EXCLUDED.status_code,
+         latency_ms = EXCLUDED.latency_ms,
+         search_job_id = EXCLUDED.search_job_id,
+         created_at = now()`,
+      ['apollo', '/organizations/enrich', requestHash, 200, latencyMs, searchJobId]
+    );
+
+    await this.pg.query(
+      `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+      [
+        searchJobId,
+        'apollo',
+        'organization-enrich',
+        companyDomain ?? companyName,
+        JSON.stringify({ item: result.item, raw: result.raw }),
+        requestHash
+      ]
+    );
+
+    return result.item;
+  }
+
+  private async fillMissingEmailsByHunter(
+    searchJobId: string,
+    companyDomain: string | null,
+    people: ApolloPersonCandidate[]
+  ): Promise<ApolloPersonCandidate[]> {
+    if (!companyDomain || people.length === 0) {
+      return people;
+    }
+
+    const output: ApolloPersonCandidate[] = [];
+    for (const person of people) {
+      if (person.email) {
+        output.push(person);
+        continue;
+      }
+
+      const names = this.splitPersonName(person.fullName);
+      if (!names.firstName) {
+        output.push(person);
+        continue;
+      }
+
+      await this.respectRateLimit('HUNTER_RATE_LIMIT_PER_MINUTE', 30);
+      const requestHash = this.hashPayload({
+        endpoint: 'email-finder',
+        domain: companyDomain,
+        firstName: names.firstName,
+        lastName: names.lastName,
+        fullName: person.fullName
+      });
+
+      const started = Date.now();
+      const finder = await this.hunter.findEmailByPerson({
+        domain: companyDomain,
+        firstName: names.firstName,
+        lastName: names.lastName,
+        fullName: person.fullName
+      });
+      const latencyMs = Date.now() - started;
+
+      await this.pg.query(
+        `INSERT INTO external_api_requests (
+           provider, endpoint, request_hash, status_code, latency_ms, search_job_id
+         ) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (provider, endpoint, request_hash)
+         DO UPDATE SET
+           status_code = EXCLUDED.status_code,
+           latency_ms = EXCLUDED.latency_ms,
+           search_job_id = EXCLUDED.search_job_id,
+           created_at = now()`,
+        ['hunter', '/v2/email-finder', requestHash, 200, latencyMs, searchJobId]
+      );
+
+      await this.pg.query(
+        `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          searchJobId,
+          'hunter',
+          'email-finder',
+          `${companyDomain}:${person.fullName}`,
+          JSON.stringify({ person, finder }),
+          requestHash
+        ]
+      );
+
+      output.push({
+        ...person,
+        email: finder.email ?? person.email,
+        confidence: finder.email ? Math.min(0.98, person.confidence + 0.08) : person.confidence,
+        raw: {
+          ...person.raw,
+          hunterEmailFinder: finder.raw
+        }
+      });
+    }
+
+    return output;
+  }
+
+  private async verifyKeyPersonEmails(
+    searchJobId: string,
+    contacts: UnifiedKeyPersonCandidate[]
+  ): Promise<UnifiedKeyPersonCandidate[]> {
+    const output: UnifiedKeyPersonCandidate[] = [];
+    for (const contact of contacts) {
+      if (!contact.email) {
+        output.push(contact);
+        continue;
+      }
+
+      await this.respectRateLimit('HUNTER_RATE_LIMIT_PER_MINUTE', 30);
+      const requestHash = this.hashPayload({
+        endpoint: 'email-verifier',
+        email: contact.email.toLowerCase()
+      });
+
+      const started = Date.now();
+      const verify = await this.hunter.verifyEmail(contact.email);
+      const latencyMs = Date.now() - started;
+      const verifySnapshot: HunterVerificationSnapshot = {
+        status: verify.status,
+        score: verify.score
+      };
+
+      await this.pg.query(
+        `INSERT INTO external_api_requests (
+           provider, endpoint, request_hash, status_code, latency_ms, search_job_id
+         ) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (provider, endpoint, request_hash)
+         DO UPDATE SET
+           status_code = EXCLUDED.status_code,
+           latency_ms = EXCLUDED.latency_ms,
+           search_job_id = EXCLUDED.search_job_id,
+           created_at = now()`,
+        ['hunter', '/v2/email-verifier', requestHash, 200, latencyMs, searchJobId]
+      );
+
+      await this.pg.query(
+        `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          searchJobId,
+          'hunter',
+          'email-verifier',
+          contact.email.toLowerCase(),
+          JSON.stringify({ email: contact.email, verification: verify }),
+          requestHash
+        ]
+      );
+
+      const verifiedStatus = verifySnapshot.status?.toLowerCase() ?? null;
+      const validStatuses = new Set(['valid', 'accept_all', 'webmail']);
+      if (verifiedStatus && !validStatuses.has(verifiedStatus)) {
+        continue;
+      }
+
+      output.push({
+        ...contact,
+        confidence: verifySnapshot.score
+          ? Number(Math.min(0.99, Math.max(contact.confidence, verifySnapshot.score / 100)).toFixed(2))
+          : contact.confidence,
+        raw: {
+          ...contact.raw,
+          hunterEmailVerifier: verify.result
+        }
+      });
+    }
+
+    return output;
   }
 
   private applyCompanyProfile(
@@ -878,10 +1163,28 @@ export class P1DiscoveryProcessor extends WorkerHost {
 
   private async findContactsWithCache(
     searchJobId: string,
-    domain: string
+    domain: string | null,
+    companyName: string
   ): Promise<HunterContactCandidate[]> {
     const normalizedDomain = this.normalizeDomain(domain);
     if (!normalizedDomain) {
+      const requestHash = this.hashPayload({ companyName, domain: null, skipped: 'missing_domain' });
+      await this.pg.query(
+        `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          searchJobId,
+          'hunter-contacts',
+          'domain-search',
+          companyName,
+          JSON.stringify({
+            skipped: true,
+            reason: 'missing_domain',
+            companyName
+          }),
+          requestHash
+        ]
+      );
       return [];
     }
 
@@ -901,6 +1204,18 @@ export class P1DiscoveryProcessor extends WorkerHost {
     if (cachedRows[0]) {
       const cached = cachedRows[0].raw_json as Record<string, unknown>;
       const items = Array.isArray(cached?.items) ? (cached.items as HunterContactCandidate[]) : [];
+      await this.pg.query(
+        `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [
+          searchJobId,
+          'hunter-contacts',
+          'domain-search',
+          normalizedDomain,
+          JSON.stringify({ ...cached, cached: true }),
+          requestHash
+        ]
+      );
       return items;
     }
 
@@ -1042,6 +1357,27 @@ export class P1DiscoveryProcessor extends WorkerHost {
       .split(/\s+/)
       .map((token) => token.trim())
       .filter((token) => token.length >= 2);
+  }
+
+  private splitPersonName(fullName: string): { firstName: string | null; lastName: string | null } {
+    const parts = fullName
+      .trim()
+      .split(/\s+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+
+    if (parts.length === 0) {
+      return { firstName: null, lastName: null };
+    }
+
+    if (parts.length === 1) {
+      return { firstName: parts[0], lastName: null };
+    }
+
+    return {
+      firstName: parts[0],
+      lastName: parts[parts.length - 1]
+    };
   }
 
   private async upsertContact(

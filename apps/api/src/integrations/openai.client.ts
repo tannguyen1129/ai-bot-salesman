@@ -50,7 +50,17 @@ export interface ProspectComposeInput {
   personEmail: string | null;
 }
 
+export interface TemplateComposeInput {
+  companyName: string;
+  companyIndustry: string | null;
+  personName: string;
+  personTitle: string | null;
+  personEmail: string | null;
+  step: number;
+}
+
 export interface ProspectCompanyReportInput {
+  modelKind?: 'balanced' | 'reasoning' | 'fast';
   promptTemplate: string;
   prospect: {
     prospectId: string;
@@ -71,22 +81,31 @@ export interface ProspectCompanyReportInput {
     sourceList: string[];
     notes: string | null;
   } | null;
+  relatedKeyPersons?: Array<{
+    name: string;
+    title: string | null;
+    email: string | null;
+    phone: string | null;
+    confidence: number | null;
+    source: string;
+  }>;
   snapshots: ProspectRawSnapshot[];
 }
 
 export interface ProspectCompanyReportResult {
   reportMarkdown: string;
   reportJson: Record<string, unknown>;
-  provider: 'openai' | 'fallback';
+  provider: 'openai' | 'gemini' | 'fallback';
   confidenceScore: number | null;
 }
 
 @Injectable()
 export class OpenAiClient {
-  private readonly client: AxiosInstance;
+  private readonly openAiClient: AxiosInstance;
+  private readonly geminiClient: AxiosInstance;
 
   constructor() {
-    this.client = axios.create({
+    this.openAiClient = axios.create({
       baseURL: 'https://api.openai.com/v1',
       timeout: Number(process.env.OPENAI_REQUEST_TIMEOUT_MS ?? 90000),
       headers: {
@@ -94,10 +113,97 @@ export class OpenAiClient {
         'Content-Type': 'application/json'
       }
     });
+
+    this.geminiClient = axios.create({
+      baseURL: 'https://generativelanguage.googleapis.com/v1beta',
+      timeout: Number(process.env.GEMINI_REQUEST_TIMEOUT_MS ?? 90000),
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+  }
+
+  private getProvider(): 'openai' | 'gemini' {
+    return process.env.AI_PROVIDER?.trim().toLowerCase() === 'gemini' ? 'gemini' : 'openai';
+  }
+
+  private getModel(kind: 'balanced' | 'reasoning' | 'fast' = 'balanced'): string {
+    if (this.getProvider() === 'gemini') {
+      if (kind === 'fast') return process.env.GEMINI_MODEL_FAST ?? 'gemini-2.5-flash';
+      if (kind === 'reasoning') return process.env.GEMINI_MODEL_REASONING ?? process.env.GEMINI_MODEL_BALANCED ?? 'gemini-2.5-pro';
+      return process.env.GEMINI_MODEL_BALANCED ?? 'gemini-2.5-flash';
+    }
+
+    if (kind === 'fast') return process.env.OPENAI_MODEL_FAST ?? 'gpt-5.4-mini';
+    if (kind === 'reasoning') return process.env.OPENAI_MODEL_REASONING ?? process.env.OPENAI_MODEL_BALANCED ?? 'gpt-5.5';
+    return process.env.OPENAI_MODEL_BALANCED ?? 'gpt-5.5';
+  }
+
+  private hasProviderKey(): boolean {
+    if (this.getProvider() === 'gemini') {
+      return Boolean(process.env.GEMINI_API_KEY?.trim());
+    }
+    return Boolean(process.env.OPENAI_API_KEY?.trim());
+  }
+
+  private async generateText(
+    prompt: string,
+    kind: 'balanced' | 'reasoning' | 'fast' = 'balanced'
+  ): Promise<{ text: string | null; provider: 'openai' | 'gemini' | 'fallback' }> {
+    if (!this.hasProviderKey()) {
+      return { text: null, provider: 'fallback' };
+    }
+
+    const model = this.getModel(kind);
+
+    try {
+      if (this.getProvider() === 'gemini') {
+        const response = await this.geminiClient.post(
+          `/models/${model}:generateContent`,
+          {
+            contents: [{ parts: [{ text: prompt }] }]
+          },
+          {
+            params: {
+              key: process.env.GEMINI_API_KEY
+            }
+          }
+        );
+
+        const parts = response.data?.candidates?.[0]?.content?.parts;
+        const text = Array.isArray(parts)
+          ? parts
+              .map((part: { text?: unknown }) => (typeof part?.text === 'string' ? part.text : ''))
+              .join('')
+              .trim()
+          : '';
+        return {
+          text: text.length > 0 ? text : null,
+          provider: 'gemini'
+        };
+      }
+
+      const response = await this.openAiClient.post('/responses', {
+        model,
+        input: prompt
+      });
+
+      const text =
+        typeof response.data?.output_text === 'string' && response.data.output_text.trim().length > 0
+          ? response.data.output_text.trim()
+          : null;
+
+      return {
+        text,
+        provider: 'openai'
+      };
+    } catch {
+      return { text: null, provider: 'fallback' };
+    }
   }
 
   async healthCheckModel(): Promise<{ ok: boolean; model: string }> {
-    const model = process.env.OPENAI_MODEL_BALANCED ?? 'gpt-5.5';
+    const model = this.getModel('balanced');
     return { ok: true, model };
   }
 
@@ -110,11 +216,6 @@ export class OpenAiClient {
     employeeEstimate: number | null;
     domain: string | null;
   }): Promise<string | null> {
-    if (!process.env.OPENAI_API_KEY) {
-      return null;
-    }
-
-    const model = process.env.OPENAI_MODEL_BALANCED ?? 'gpt-5.5';
     const prompt = [
       'Bạn là trợ lý sales B2B enterprise.',
       `Phân tích candidate: ${input.candidateName}`,
@@ -125,21 +226,8 @@ export class OpenAiClient {
       'Hãy viết 3-4 câu tiếng Việt: nhận định mức phù hợp, rủi ro dữ liệu, và gợi ý bước tiếp theo cho sales.'
     ].join('\n');
 
-    try {
-      const response = await this.client.post('/responses', {
-        model,
-        input: prompt
-      });
-
-      const outputText =
-        typeof response.data?.output_text === 'string' && response.data.output_text.trim().length > 0
-          ? response.data.output_text.trim()
-          : null;
-
-      return outputText;
-    } catch {
-      return null;
-    }
+    const generated = await this.generateText(prompt, 'balanced');
+    return generated.text;
   }
 
   async cleanProspectForSheet(input: {
@@ -148,11 +236,10 @@ export class OpenAiClient {
   }): Promise<CleanedProspectForSheet> {
     const fallback = this.fallbackCleanProspect(input.prospect, input.snapshots);
 
-    if (!process.env.OPENAI_API_KEY) {
+    if (!this.hasProviderKey()) {
       return fallback;
     }
 
-    const model = process.env.OPENAI_MODEL_BALANCED ?? 'gpt-5.5';
     const prompt = [
       'Bạn là data quality assistant cho hệ thống sales B2B.',
       'Nhiệm vụ: làm sạch và chuẩn hóa thông tin prospect từ raw snapshots đa nguồn.',
@@ -182,42 +269,32 @@ export class OpenAiClient {
       'Ưu tiên dữ liệu có độ đầy đủ cao; chuẩn hóa domain bỏ protocol/www; email lower-case; loại bỏ giá trị không chắc chắn.'
     ].join('\n');
 
-    try {
-      const response = await this.client.post('/responses', {
-        model,
-        input: prompt
-      });
-
-      const outputText =
-        typeof response.data?.output_text === 'string' && response.data.output_text.trim().length > 0
-          ? response.data.output_text.trim()
-          : '';
-
-      const parsed = this.safeParseCleanJson(outputText);
-      if (!parsed) {
-        return fallback;
-      }
-
-      return this.normalizeCleanedOutput(parsed, fallback);
-    } catch {
+    const generated = await this.generateText(prompt, 'balanced');
+    if (!generated.text) {
       return fallback;
     }
+
+    const parsed = this.safeParseCleanJson(generated.text);
+    if (!parsed) {
+      return fallback;
+    }
+
+    return this.normalizeCleanedOutput(parsed, fallback);
   }
 
   async composeDraftEmail(input: {
     prospect: ProspectComposeInput;
     promptTemplate: string;
-  }): Promise<{ subject: string; bodyText: string; provider: 'openai' | 'fallback' }> {
+  }): Promise<{ subject: string; bodyText: string; provider: 'openai' | 'gemini' | 'fallback' }> {
     const fallback = this.fallbackComposeDraft(input.prospect);
 
-    if (!process.env.OPENAI_API_KEY) {
+    if (!this.hasProviderKey()) {
       return {
         ...fallback,
         provider: 'fallback'
       };
     }
 
-    const model = process.env.OPENAI_MODEL_BALANCED ?? 'gpt-5.5';
     const prompt = [
       input.promptTemplate,
       '',
@@ -225,55 +302,96 @@ export class OpenAiClient {
       `prospect: ${JSON.stringify(input.prospect)}`
     ].join('\n');
 
-    try {
-      const response = await this.client.post('/responses', {
-        model,
-        input: prompt
-      });
-
-      const outputText =
-        typeof response.data?.output_text === 'string' && response.data.output_text.trim().length > 0
-          ? response.data.output_text.trim()
-          : '';
-
-      const parsed = this.safeParseCleanJson(outputText);
-      if (!parsed) {
-        return { ...fallback, provider: 'fallback' };
-      }
-
-      const subject =
-        typeof parsed.subject === 'string' && parsed.subject.trim().length > 0
-          ? parsed.subject.trim()
-          : fallback.subject;
-      const bodyText =
-        typeof parsed.body_text === 'string' && parsed.body_text.trim().length > 0
-          ? parsed.body_text.trim()
-          : fallback.bodyText;
-
-      return {
-        subject,
-        bodyText,
-        provider: 'openai'
-      };
-    } catch {
+    const generated = await this.generateText(prompt, 'balanced');
+    if (!generated.text) {
       return {
         ...fallback,
         provider: 'fallback'
       };
     }
+
+    const parsed = this.safeParseCleanJson(generated.text);
+    if (!parsed) {
+      return { ...fallback, provider: 'fallback' };
+    }
+
+    const subject =
+      typeof parsed.subject === 'string' && parsed.subject.trim().length > 0 ? parsed.subject.trim() : fallback.subject;
+    const bodyText =
+      typeof parsed.body_text === 'string' && parsed.body_text.trim().length > 0
+        ? parsed.body_text.trim()
+        : fallback.bodyText;
+
+    return {
+      subject,
+      bodyText,
+      provider: generated.provider
+    };
+  }
+
+  async composeDraftFromTemplate(input: {
+    promptTemplate: string;
+    context: TemplateComposeInput;
+    templateSubject: string;
+    templateBody: string;
+  }): Promise<{ subject: string; bodyText: string; provider: 'openai' | 'gemini' | 'fallback' }> {
+    const fallback = {
+      subject: input.templateSubject,
+      bodyText: input.templateBody
+    };
+
+    if (!this.hasProviderKey()) {
+      return { ...fallback, provider: 'fallback' };
+    }
+
+    const prompt = [
+      input.promptTemplate,
+      '',
+      'Ban la sales assistant. Nhiem vu: ca nhan hoa NOI DUNG tu TEMPLATE SAN CO, khong viet lai tu dau.',
+      'Bat buoc giu giong van chuyen nghiep, ngan gon, co CTA.',
+      'Bat buoc giu cau chao mo dau neu da co trong template.',
+      'Return strict JSON with keys: subject, body_text',
+      `context: ${JSON.stringify(input.context)}`,
+      `template_subject: ${JSON.stringify(input.templateSubject)}`,
+      `template_body: ${JSON.stringify(input.templateBody)}`
+    ].join('\n');
+
+    const generated = await this.generateText(prompt, 'balanced');
+    if (!generated.text) {
+      return { ...fallback, provider: 'fallback' };
+    }
+
+    const parsed = this.safeParseCleanJson(generated.text);
+    if (!parsed) {
+      return { ...fallback, provider: 'fallback' };
+    }
+
+    const subject =
+      typeof parsed.subject === 'string' && parsed.subject.trim().length > 0
+        ? parsed.subject.trim()
+        : fallback.subject;
+    const bodyText =
+      typeof parsed.body_text === 'string' && parsed.body_text.trim().length > 0
+        ? parsed.body_text.trim()
+        : fallback.bodyText;
+
+    return {
+      subject,
+      bodyText,
+      provider: generated.provider
+    };
   }
 
   async generateProspectCompanyReport(input: ProspectCompanyReportInput): Promise<ProspectCompanyReportResult> {
     const fallback = this.fallbackProspectCompanyReport(input);
 
-    if (!process.env.OPENAI_API_KEY) {
+    if (!this.hasProviderKey()) {
       return {
         ...fallback,
         provider: 'fallback'
       };
     }
 
-    const model = process.env.OPENAI_MODEL_REASONING ?? process.env.OPENAI_MODEL_BALANCED ?? 'gpt-5.5';
     const prompt = [
       input.promptTemplate,
       '',
@@ -297,6 +415,16 @@ export class OpenAiClient {
             phone: 'string|null',
             linkedin: 'string|null'
           },
+          all_key_persons: [
+            {
+              name: 'string',
+              title: 'string|null',
+              email: 'string|null',
+              phone: 'string|null',
+              confidence_0_1: 'number|null',
+              source: 'string|null'
+            }
+          ],
           buying_signals: ['string'],
           risks: ['string'],
           recommended_next_steps: ['string'],
@@ -307,51 +435,44 @@ export class OpenAiClient {
         2
       ),
       `Prospect normalized input: ${JSON.stringify(input.prospect)}`,
+      `All key persons in this company/job: ${JSON.stringify(input.relatedKeyPersons ?? [])}`,
       `Cleaned AI profile: ${JSON.stringify(input.cleanedProfile ?? null)}`,
       `Raw snapshots(sample): ${JSON.stringify(this.trimSnapshots(input.snapshots))}`,
-      'Yeu cau: viet ngan gon, dung du lieu thuc te tu input, khong bịa.'
+      'Yeu cau: tong hop DAY DU all_key_persons, khong bo sot nguoi. Viet ngan gon, dung du lieu thuc te tu input, khong bịa.'
     ].join('\n');
 
-    try {
-      const response = await this.client.post('/responses', {
-        model,
-        input: prompt
-      });
-
-      const outputText =
-        typeof response.data?.output_text === 'string' && response.data.output_text.trim().length > 0
-          ? response.data.output_text.trim()
-          : '';
-      const parsed = this.safeParseCleanJson(outputText);
-      if (!parsed) {
-        return {
-          ...fallback,
-          provider: 'fallback'
-        };
-      }
-
-      const reportJson = this.normalizeProspectCompanyReport(parsed, fallback.reportJson);
-      const reportMarkdown = this.renderProspectCompanyReportMarkdown(reportJson);
-      const confidenceScore = this.readNumber(reportJson.qualification_score_100, 0, 100);
-
-      return {
-        reportJson,
-        reportMarkdown,
-        confidenceScore,
-        provider: 'openai'
-      };
-    } catch {
+    const generated = await this.generateText(prompt, input.modelKind ?? 'balanced');
+    if (!generated.text) {
       return {
         ...fallback,
         provider: 'fallback'
       };
     }
+
+    const parsed = this.safeParseCleanJson(generated.text);
+    if (!parsed) {
+      return {
+        ...fallback,
+        provider: 'fallback'
+      };
+    }
+
+    const reportJson = this.normalizeProspectCompanyReport(parsed, fallback.reportJson);
+    const reportMarkdown = this.renderProspectCompanyReportMarkdown(reportJson);
+    const confidenceScore = this.readNumber(reportJson.qualification_score_100, 0, 100);
+
+    return {
+      reportJson,
+      reportMarkdown,
+      confidenceScore,
+      provider: generated.provider
+    };
   }
 
   private trimSnapshots(snapshots: ProspectRawSnapshot[]): ProspectRawSnapshot[] {
-    return snapshots.slice(0, 20).map((item) => ({
+    return snapshots.map((item) => ({
       ...item,
-      rawJson: this.trimJson(item.rawJson, 2800)
+      rawJson: this.trimJson(item.rawJson, 5000)
     }));
   }
 
@@ -525,6 +646,15 @@ export class OpenAiClient {
         phone: input.prospect.personPhone,
         linkedin: input.cleanedProfile?.keyPersonLinkedin ?? null
       },
+      all_key_persons:
+        input.relatedKeyPersons?.map((item) => ({
+          name: item.name,
+          title: item.title,
+          email: item.email,
+          phone: item.phone,
+          confidence_0_1: item.confidence,
+          source: item.source
+        })) ?? [],
       buying_signals: [
         'Da xac dinh duoc key person de tiep can.',
         'Da co company-domain va nganh co ban de phan loai lead.'
@@ -558,6 +688,7 @@ export class OpenAiClient {
   ): Record<string, unknown> {
     const fallbackCompany = (fallback.company_overview as Record<string, unknown>) ?? {};
     const fallbackKeyPerson = (fallback.key_person as Record<string, unknown>) ?? {};
+    const fallbackAllKeyPersons = Array.isArray(fallback.all_key_persons) ? fallback.all_key_persons : [];
 
     return {
       executive_summary: this.readString(raw.executive_summary) ?? (fallback.executive_summary as string),
@@ -577,6 +708,7 @@ export class OpenAiClient {
         linkedin:
           this.readString(this.readObject(raw.key_person)?.linkedin) ?? (fallbackKeyPerson.linkedin as string | null)
       },
+      all_key_persons: this.normalizeAllKeyPersons(raw.all_key_persons, fallbackAllKeyPersons),
       buying_signals: this.readStringArray(raw.buying_signals, fallback.buying_signals),
       risks: this.readStringArray(raw.risks, fallback.risks),
       recommended_next_steps: this.readStringArray(raw.recommended_next_steps, fallback.recommended_next_steps),
@@ -590,6 +722,7 @@ export class OpenAiClient {
   private renderProspectCompanyReportMarkdown(report: Record<string, unknown>): string {
     const company = (report.company_overview as Record<string, unknown>) ?? {};
     const keyPerson = (report.key_person as Record<string, unknown>) ?? {};
+    const allKeyPersons = Array.isArray(report.all_key_persons) ? report.all_key_persons : [];
     const lines = [
       `# Bao Cao Tong Hop Cong Ty: ${String(company.name ?? 'N/A')}`,
       '',
@@ -608,6 +741,9 @@ export class OpenAiClient {
       `- Email: ${String(keyPerson.email ?? 'N/A')}`,
       `- Phone: ${String(keyPerson.phone ?? 'N/A')}`,
       `- LinkedIn: ${String(keyPerson.linkedin ?? 'N/A')}`,
+      '',
+      '## All Key Persons',
+      ...this.renderAllKeyPersons(allKeyPersons),
       '',
       '## Buying Signals',
       ...this.renderBulletList(report.buying_signals),
@@ -654,5 +790,53 @@ export class OpenAiClient {
       return null;
     }
     return Number(Math.max(min, Math.min(max, value)).toFixed(2));
+  }
+
+  private normalizeAllKeyPersons(value: unknown, fallback: unknown[]): Array<Record<string, unknown>> {
+    const source = Array.isArray(value) ? value : fallback;
+    const normalized: Array<Record<string, unknown>> = [];
+
+    for (const item of source) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        continue;
+      }
+
+      const row = item as Record<string, unknown>;
+      const name = this.readString(row.name);
+      if (!name) {
+        continue;
+      }
+
+      normalized.push({
+        name,
+        title: this.readString(row.title),
+        email: this.readString(row.email),
+        phone: this.readString(row.phone),
+        confidence_0_1: this.readNumber(row.confidence_0_1, 0, 1),
+        source: this.readString(row.source)
+      });
+    }
+
+    return normalized;
+  }
+
+  private renderAllKeyPersons(items: unknown[]): string[] {
+    if (!Array.isArray(items) || items.length === 0) {
+      return ['- N/A'];
+    }
+
+    return items
+      .map((item) => {
+        const row = this.readObject(item) ?? {};
+        const name = this.readString(row.name) ?? 'N/A';
+        const title = this.readString(row.title) ?? 'N/A';
+        const email = this.readString(row.email) ?? 'N/A';
+        const phone = this.readString(row.phone) ?? 'N/A';
+        const confidence = this.readNumber(row.confidence_0_1, 0, 1);
+        const source = this.readString(row.source) ?? 'N/A';
+        const confidenceText = confidence === null ? 'N/A' : confidence.toFixed(2);
+        return `- ${name} | ${title} | ${email} | ${phone} | confidence=${confidenceText} | source=${source}`;
+      })
+      .slice(0, 100);
   }
 }

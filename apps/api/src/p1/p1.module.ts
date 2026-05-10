@@ -11,15 +11,25 @@ import { ApolloClient } from '../integrations/apollo.client';
 import { CompanyCrawlerClient } from '../integrations/company-crawler.client';
 import { OpenAiClient } from '../integrations/openai.client';
 import { P1TelegramService } from './p1.telegram.service';
+import { P1TemplateLearningProcessor, P1TemplateLearningScheduler } from './p1.template-learning.processor';
 
 @Module({
-  imports: [BullModule.registerQueue({ name: 'p1-sheets-sync' }, { name: 'p1-discovery' }, { name: 'p1-email-send' })],
+  imports: [
+    BullModule.registerQueue(
+      { name: 'p1-sheets-sync' },
+      { name: 'p1-discovery' },
+      { name: 'p1-email-send' },
+      { name: 'p1-template-learning' }
+    )
+  ],
   controllers: [P1Controller],
   providers: [
     P1Service,
     P1SheetSyncProcessor,
     P1DiscoveryProcessor,
     P1EmailSendProcessor,
+    P1TemplateLearningProcessor,
+    P1TemplateLearningScheduler,
     P1TelegramService,
     RapidLinkedinClient,
     HunterClient,

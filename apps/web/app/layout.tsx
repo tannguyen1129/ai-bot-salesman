@@ -3,8 +3,8 @@ import type { Metadata } from 'next';
 import { ReactNode } from 'react';
 
 export const metadata: Metadata = {
-  title: 'AI Bot Salesman P1 Dashboard',
-  description: 'VNETWORK AI Bot Salesman - P1 Approved Flow'
+  title: 'AI Sales Agent P1',
+  description: 'VNETWORK internal sales workflow product'
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
@@ -15,13 +15,15 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           <div className="siteHeaderInner">
             <div className="brandBlock">
               <strong>VNETWORK</strong>
-              <span>AI Bot Salesman P1</span>
+              <span>AI Sales Agent P1</span>
             </div>
             <nav className="siteNav">
-              <a href="/">Trang chủ</a>
-              <a href="/workspace">Workspace P1</a>
+              <a href="/">Tổng quan</a>
+              <a href="/workspace">Workspace</a>
+              <a href="/report-workflow">Report Studio</a>
+              <a href="/console">Operations</a>
               <a href="/guide">Playbook</a>
-              <a href="/system-check">Kiểm tra kết nối</a>
+              <a href="/system-check">System Check</a>
             </nav>
           </div>
         </header>
@@ -31,12 +33,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <footer className="siteFooter">
           <div className="siteFooterInner">
             <div>
-              <strong>AI Bot Salesman - P1</strong>
-              <p>Nền tảng tự động hóa prospect discovery theo luồng đã phê duyệt.</p>
+              <strong>AI Sales Agent - P1 Email Outreach</strong>
+              <p>Frontend vận hành nội bộ cho discovery, prospecting, draft review và reporting.</p>
             </div>
             <div className="footerMeta">
-              <span>P1 Approved Flow</span>
-              <span>Next.js + NestJS + PostgreSQL + Redis + Worker Queue</span>
+              <span>Stack: Next.js · NestJS · PostgreSQL · Redis</span>
+              <span>Safe Mode mặc định bật cho P1</span>
             </div>
           </div>
         </footer>

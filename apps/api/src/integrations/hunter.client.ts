@@ -11,6 +11,12 @@ export interface HunterContactCandidate {
   raw: Record<string, unknown>;
 }
 
+export interface HunterEmailVerifierResult {
+  status: string | null;
+  score: number | null;
+  result: Record<string, unknown>;
+}
+
 @Injectable()
 export class HunterClient {
   private readonly client: AxiosInstance;
@@ -49,6 +55,76 @@ export class HunterClient {
     return {
       items: contacts,
       raw: response.data
+    };
+  }
+
+  async findEmailByPerson(params: {
+    domain: string;
+    firstName?: string | null;
+    lastName?: string | null;
+    fullName?: string | null;
+  }): Promise<{ email: string | null; score: number | null; raw: unknown }> {
+    if (!process.env.HUNTER_API_KEY) {
+      return {
+        email: null,
+        score: null,
+        raw: { skipped: true, reason: 'HUNTER_API_KEY is missing', params }
+      };
+    }
+
+    const response = await this.client.get('/v2/email-finder', {
+      params: {
+        domain: params.domain,
+        first_name: params.firstName ?? undefined,
+        last_name: params.lastName ?? undefined,
+        full_name: params.fullName ?? undefined,
+        api_key: process.env.HUNTER_API_KEY
+      }
+    });
+
+    const payload = response.data as Record<string, unknown>;
+    const data = (payload?.data ?? {}) as Record<string, unknown>;
+    const email = this.pickString(data, ['email']);
+    const rawScore = data.score;
+    const score = typeof rawScore === 'number' && Number.isFinite(rawScore) ? rawScore : null;
+
+    return {
+      email,
+      score,
+      raw: response.data
+    };
+  }
+
+  async verifyEmail(email: string): Promise<HunterEmailVerifierResult> {
+    if (!process.env.HUNTER_API_KEY) {
+      return {
+        status: null,
+        score: null,
+        result: {
+          skipped: true,
+          reason: 'HUNTER_API_KEY is missing',
+          email
+        }
+      };
+    }
+
+    const response = await this.client.get('/v2/email-verifier', {
+      params: {
+        email,
+        api_key: process.env.HUNTER_API_KEY
+      }
+    });
+
+    const payload = response.data as Record<string, unknown>;
+    const data = (payload?.data ?? {}) as Record<string, unknown>;
+    const status = this.pickString(data, ['status']);
+    const rawScore = data.score;
+    const score = typeof rawScore === 'number' && Number.isFinite(rawScore) ? rawScore : null;
+
+    return {
+      status,
+      score,
+      result: data
     };
   }
 

@@ -101,17 +101,28 @@ export class ApolloClient {
     }
 
     try {
-      const response = await this.client.post('/mixed_people/api_search', {
+      const requestBody = {
         q_keywords: params.companyName,
         q_organization_domains_list: params.domain ? [params.domain] : undefined,
         person_seniorities: ['c_suite', 'founder', 'vp', 'head', 'director'],
         page: 1,
         per_page: Math.max(5, Math.min(25, params.limit ?? 5))
-      }, {
-        headers: {
-          'x-api-key': process.env.APOLLO_API_KEY
-        }
-      });
+      };
+
+      let response;
+      try {
+        response = await this.client.post('/mixed_people/search', requestBody, {
+          headers: {
+            'x-api-key': process.env.APOLLO_API_KEY
+          }
+        });
+      } catch {
+        response = await this.client.post('/mixed_people/api_search', requestBody, {
+          headers: {
+            'x-api-key': process.env.APOLLO_API_KEY
+          }
+        });
+      }
 
       const payload = response.data as Record<string, unknown>;
       const people = this.readArray(payload, ['people', 'contacts', 'data']);
@@ -130,6 +141,50 @@ export class ApolloClient {
         raw: {
           failed: true,
           reason: error instanceof Error ? error.message : 'apollo people search failed'
+        }
+      };
+    }
+  }
+
+  async enrichOrganization(
+    companyName: string,
+    companyDomain?: string | null
+  ): Promise<{ item: ApolloCompanyCandidate | null; raw: unknown }> {
+    if (!process.env.APOLLO_API_KEY) {
+      return {
+        item: null,
+        raw: {
+          skipped: true,
+          reason: 'APOLLO_API_KEY is missing',
+          companyName,
+          companyDomain
+        }
+      };
+    }
+
+    try {
+      const response = await this.client.get('/organizations/enrich', {
+        params: {
+          domain: companyDomain ?? undefined,
+          organization_name: companyName || undefined
+        },
+        headers: {
+          'x-api-key': process.env.APOLLO_API_KEY
+        }
+      });
+
+      const payload = response.data as Record<string, unknown>;
+      const organization = (payload.organization as Record<string, unknown> | undefined) ?? payload;
+      return {
+        item: this.normalizeCompany(organization),
+        raw: response.data
+      };
+    } catch (error) {
+      return {
+        item: null,
+        raw: {
+          failed: true,
+          reason: error instanceof Error ? error.message : 'apollo organization enrich failed'
         }
       };
     }
@@ -218,9 +273,11 @@ export class ApolloClient {
       return null;
     }
 
+    const domainCandidate = this.pickFirstString(source, ['primary_domain', 'domain', 'website_url']);
+
     return {
       name,
-      domain: this.pickFirstString(source, ['website_url', 'domain', 'primary_domain']),
+      domain: this.normalizeDomain(domainCandidate),
       linkedinUrl: this.pickFirstString(source, ['linkedin_url']),
       industry: this.pickFirstString(source, ['industry']),
       employeeEstimate: this.pickFirstNumber(source, ['estimated_num_employees', 'employee_count']),
@@ -330,5 +387,20 @@ export class ApolloClient {
       .split(/\s+/)
       .map((token) => token.trim())
       .filter((token) => token.length > 1);
+  }
+
+  private normalizeDomain(value: string | null): string | null {
+    if (!value) {
+      return null;
+    }
+
+    const normalized = value
+      .toLowerCase()
+      .replace(/^https?:\/\//, '')
+      .replace(/^www\./, '')
+      .replace(/\/.*$/, '')
+      .trim();
+
+    return normalized.includes('.') ? normalized : null;
   }
 }

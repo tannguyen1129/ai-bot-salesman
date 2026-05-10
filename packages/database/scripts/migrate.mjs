@@ -1,7 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import dotenv from 'dotenv';
 import pg from 'pg';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -9,7 +8,14 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 
 // Load root .env when running from workspace script.
-dotenv.config({ path: path.join(repoRoot, '.env') });
+try {
+  const dotenv = await import('dotenv');
+  dotenv.config({ path: path.join(repoRoot, '.env') });
+} catch (error) {
+  if (error?.code !== 'ERR_MODULE_NOT_FOUND') {
+    throw error;
+  }
+}
 
 const fallbackDatabaseUrl = `postgresql://${process.env.POSTGRES_USER ?? 'bot_salesman'}:${process.env.POSTGRES_PASSWORD ?? 'bot_salesman_dev'}@${process.env.POSTGRES_HOST ?? 'localhost'}:${process.env.POSTGRES_PORT ?? '5432'}/${process.env.POSTGRES_DB ?? 'bot_salesman'}`;
 const connectionString = process.env.DATABASE_URL ?? fallbackDatabaseUrl;

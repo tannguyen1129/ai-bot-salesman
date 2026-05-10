@@ -77,9 +77,34 @@ export class ListProspectsQueryDto {
   limit?: number;
 }
 
+export class ListProspectReportsQueryDto {
+  @IsOptional()
+  @IsString()
+  q?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  offset?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
+}
+
 export class ProspectIdParamDto {
   @IsUUID()
   id!: string;
+}
+
+export class GenerateProspectReportDto {
+  @IsOptional()
+  @IsIn(['fast', 'balanced', 'reasoning'])
+  modelKind?: 'fast' | 'balanced' | 'reasoning';
 }
 
 export class DraftIdParamDto {
@@ -90,6 +115,33 @@ export class DraftIdParamDto {
 export class SearchJobIdParamDto {
   @IsUUID()
   id!: string;
+}
+
+export class ListRawSnapshotsQueryDto {
+  @IsOptional()
+  @IsString()
+  source?: string;
+
+  @IsOptional()
+  @IsString()
+  entityType?: string;
+
+  @IsOptional()
+  @IsString()
+  q?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  offset?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
 }
 
 export class UpdateProspectStatusDto {
@@ -142,6 +194,25 @@ export class ListDraftsQueryDto {
   limit?: number;
 }
 
+export class ListEmailHistoryQueryDto {
+  @IsOptional()
+  @IsIn(['sent', 'failed', 'bounced', 'delivered'])
+  status?: 'sent' | 'failed' | 'bounced' | 'delivered';
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  offset?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
+}
+
 export class ReviewDraftDto {
   @IsIn(['approve', 'reject', 'edit'])
   action!: 'approve' | 'reject' | 'edit';
@@ -167,4 +238,90 @@ export class ReviewDraftDto {
 export class TelegramWebhookQueryDto {
   @IsString()
   secret!: string;
+}
+
+export class ListTemplatesQueryDto {
+  @IsOptional()
+  @IsString()
+  q?: string;
+
+  @IsOptional()
+  @IsIn(['active', 'deprecated', 'draft'])
+  status?: 'active' | 'deprecated' | 'draft';
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  offset?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
+}
+
+export class CreateTemplateDto {
+  @IsString()
+  @Length(2, 160)
+  industry!: string;
+
+  @IsString()
+  @Length(2, 400)
+  subjectTemplate!: string;
+
+  @IsString()
+  @Length(10, 20000)
+  bodyTemplate!: string;
+
+  @IsOptional()
+  @IsIn(['active', 'deprecated', 'draft'])
+  status?: 'active' | 'deprecated' | 'draft';
+}
+
+export class UpdateTemplateDto {
+  @IsOptional()
+  @IsString()
+  @Length(2, 160)
+  industry?: string;
+
+  @IsOptional()
+  @IsString()
+  @Length(2, 400)
+  subjectTemplate?: string;
+
+  @IsOptional()
+  @IsString()
+  @Length(10, 20000)
+  bodyTemplate?: string;
+
+  @IsOptional()
+  @IsIn(['active', 'deprecated', 'draft'])
+  status?: 'active' | 'deprecated' | 'draft';
+}
+
+export class TemplateIdParamDto {
+  @IsUUID()
+  id!: string;
+}
+
+export class ListTemplateCandidatesQueryDto {
+  @IsOptional()
+  @IsString()
+  templateKey?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  offset?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
 }

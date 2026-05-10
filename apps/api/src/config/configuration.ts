@@ -61,10 +61,21 @@ export const configuration = () => ({
     modelBalanced: process.env.OPENAI_MODEL_BALANCED ?? 'gpt-5.5',
     timeoutMs: Number(process.env.OPENAI_REQUEST_TIMEOUT_MS ?? 90000)
   },
+  ai: {
+    provider: process.env.AI_PROVIDER ?? 'openai',
+    geminiKey: process.env.GEMINI_API_KEY,
+    geminiModelBalanced: process.env.GEMINI_MODEL_BALANCED ?? 'gemini-2.5-flash',
+    geminiTimeoutMs: Number(process.env.GEMINI_REQUEST_TIMEOUT_MS ?? 90000)
+  },
   p1Email: {
     enableExternalSend: (process.env.P1_ENABLE_EXTERNAL_SEND ?? 'false') === 'true',
     outboundRedirectTarget: process.env.P1_OUTBOUND_REDIRECT_TARGET ?? 'tandtnt18@gmail.com',
-    sender: process.env.P1_EMAIL_SENDER ?? 'p1-demo@vnetwork.vn',
+    sender: process.env.P1_EMAIL_SENDER ?? 'tandtnt15@gmail.com',
+    smtpHost: process.env.P1_SMTP_HOST ?? 'smtp.gmail.com',
+    smtpPort: Number(process.env.P1_SMTP_PORT ?? 465),
+    smtpSecure: (process.env.P1_SMTP_SECURE ?? 'true') === 'true',
+    smtpUser: process.env.P1_SMTP_USER ?? '',
+    smtpPass: process.env.P1_SMTP_PASS ?? '',
     smtpAllowlistDomains: (process.env.P1_SMTP_ALLOWLIST_DOMAINS ?? 'gmail.com,vnetwork.vn')
       .split(',')
       .map((item) => item.trim().toLowerCase())

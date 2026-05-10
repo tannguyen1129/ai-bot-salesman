@@ -2,22 +2,14 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 
-type PagedResult<T> = {
-  items: T[];
-  total: number;
-  limit: number;
-  offset: number;
-};
+type PagedResult<T> = { items: T[]; total: number; limit: number; offset: number };
 
 type SearchJob = {
   id: string;
   keyword: string;
   industry: string | null;
   region: string | null;
-  source: string;
   status: 'queued' | 'running' | 'completed' | 'failed';
-  started_at: string | null;
-  completed_at: string | null;
   total_prospects: number;
   error_message: string | null;
   created_at: string;
@@ -25,414 +17,210 @@ type SearchJob = {
 
 type Prospect = {
   id: string;
-  search_job_id: string;
   company: string;
-  domain: string | null;
   person_name: string;
   position: string | null;
   email: string | null;
+  status: string;
   source: string;
-  status: 'new' | 'qualified' | 'contacted' | 'meeting' | 'disqualified' | 'archived';
   created_at: string;
 };
 
 type Draft = {
   id: string;
   prospect_id: string | null;
-  company_id: string | null;
-  subject: string;
-  body_text: string;
   status: 'pending_review' | 'approved' | 'rejected' | 'sent';
   compose_mode: string;
   edit_count: number;
-  reject_reason: string | null;
   created_at: string;
   approved_at: string | null;
   sent_at: string | null;
 };
 
-type EmailSafeMode = {
-  enableExternalSend: boolean;
-  outboundRedirectTarget: string;
-  smtpAllowlistDomains: string[];
-};
-
-type SafeModePreview = {
-  intendedRecipient: string;
-  actualRecipient: string;
+type EmailHistory = {
+  id: string;
+  draft_id: string;
+  sender: string;
+  intended_recipient: string;
+  actual_recipient: string;
   redirected: boolean;
   subject: string;
-  bodyText: string;
-  bodyHtml: string | null;
-  headers: Record<string, string>;
+  status: 'sent' | 'failed' | 'bounced' | 'delivered';
+  sent_at: string | null;
+  created_at: string;
 };
 
 type ProspectCompanyReport = {
   id: string;
   prospect_id: string;
-  search_job_id: string | null;
   company_name: string;
   report_markdown: string;
-  report_json: Record<string, unknown>;
-  provider: 'openai' | 'fallback';
+  report_json?: Record<string, unknown>;
+  provider: 'openai' | 'gemini' | 'fallback';
   source_count: number;
   confidence_score: string | null;
   generated_at: string;
-  updated_at: string;
 };
 
-class ApiError extends Error {
-  constructor(
-    readonly kind: 'HTTP' | 'NETWORK' | 'TIMEOUT' | 'UNKNOWN',
-    message: string,
-    readonly status?: number
-  ) {
-    super(message);
-  }
-}
+type ReportModelKind = 'fast' | 'balanced' | 'reasoning';
+
+type RawSnapshot = {
+  id: string;
+  job_id: string | null;
+  source: string;
+  entity_type: string;
+  entity_id: string | null;
+  raw_json: unknown;
+  content_hash: string | null;
+  created_at: string;
+};
 
 const envApiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? '';
-const jobPageSizes = [5, 10, 20];
-const prospectPageSizes = [10, 20, 50];
-const draftPageSizes = [5, 10, 20];
 
 function resolveApiBase(): string {
-  if (typeof window === 'undefined') {
-    return envApiBase || 'http://localhost:4000';
-  }
-
+  if (typeof window === 'undefined') return envApiBase || 'http://localhost:4000';
   const host = window.location.hostname;
   const protocol = window.location.protocol || 'http:';
-
-  if (envApiBase.trim().length > 0) {
-    const pointsToLocalhost = /localhost|127\.0\.0\.1/.test(envApiBase);
-    const browsingLocally = host === 'localhost' || host === '127.0.0.1';
-    if (!pointsToLocalhost || browsingLocally) {
-      return envApiBase;
-    }
-  }
-
-  return `${protocol}//${host}:4000`;
+  if (envApiBase.trim()) return envApiBase;
+  const browsingLocally = host === 'localhost' || host === '127.0.0.1';
+  return browsingLocally ? `${protocol}//${host}:4000` : `${protocol}//${host}`;
 }
 
 function formatDate(value: string | null): string {
-  if (!value) {
-    return '-';
-  }
+  if (!value) return '-';
   return new Date(value).toLocaleString('vi-VN');
 }
 
-function totalPages(total: number, limit: number): number {
-  return Math.max(1, Math.ceil(total / Math.max(1, limit)));
+function readObj(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
 }
 
-function normalizeError(error: unknown): ApiError {
-  if (error instanceof ApiError) {
-    return error;
-  }
-
-  if (error instanceof DOMException && error.name === 'AbortError') {
-    return new ApiError('TIMEOUT', 'Yeu cau timeout, vui long thu lai.');
-  }
-
-  if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
-    return new ApiError('NETWORK', 'Khong ket noi duoc API backend.');
-  }
-
-  if (error instanceof Error) {
-    return new ApiError('UNKNOWN', error.message);
-  }
-
-  return new ApiError('UNKNOWN', 'Loi khong xac dinh.');
+function readStr(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : 'N/A';
 }
 
-async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
-  let timeoutId: number | null = null;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = window.setTimeout(() => {
-      reject(new ApiError('TIMEOUT', 'Yeu cau timeout, vui long thu lai.'));
-    }, timeoutMs);
-  });
-
-  try {
-    return (await Promise.race([fetch(input, init), timeoutPromise])) as Response;
-  } finally {
-    if (timeoutId !== null) {
-      window.clearTimeout(timeoutId);
-    }
-  }
-}
-
-function jobStatusLabel(status: SearchJob['status']): string {
-  if (status === 'queued') return 'Queued';
-  if (status === 'running') return 'Running';
-  if (status === 'completed') return 'Completed';
-  return 'Failed';
-}
-
-function draftStatusLabel(status: Draft['status']): string {
-  if (status === 'pending_review') return 'Pending Review';
-  if (status === 'approved') return 'Approved';
-  if (status === 'rejected') return 'Rejected';
-  return 'Sent';
+function readStrArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
 }
 
 export default function WorkspacePage() {
   const [apiBase, setApiBase] = useState(resolveApiBase);
-  const [detectingApiBase, setDetectingApiBase] = useState(true);
-  const [errorText, setErrorText] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [autoRefresh, setAutoRefresh] = useState(true);
-  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [errorText, setErrorText] = useState<string | null>(null);
 
-  const [jobPage, setJobPage] = useState(1);
-  const [jobLimit, setJobLimit] = useState(5);
-  const [jobStatusFilter, setJobStatusFilter] = useState<'all' | 'queued' | 'running' | 'completed' | 'failed'>('all');
-  const [jobQuery, setJobQuery] = useState('');
-
-  const [prospectPage, setProspectPage] = useState(1);
-  const [prospectLimit, setProspectLimit] = useState(10);
-  const [prospectStatusFilter, setProspectStatusFilter] = useState<
-    'all' | 'new' | 'qualified' | 'contacted' | 'meeting' | 'disqualified' | 'archived'
-  >('all');
-  const [prospectQuery, setProspectQuery] = useState('');
-
-  const [draftPage, setDraftPage] = useState(1);
-  const [draftLimit, setDraftLimit] = useState(5);
-  const [draftStatusFilter, setDraftStatusFilter] = useState<'all' | 'pending_review' | 'approved' | 'rejected' | 'sent'>(
-    'all'
-  );
+  const [searchForm, setSearchForm] = useState({ companyName: '', region: '', industry: '' });
+  const [jobs, setJobs] = useState<PagedResult<SearchJob>>({ items: [], total: 0, limit: 10, offset: 0 });
+  const [prospects, setProspects] = useState<PagedResult<Prospect>>({ items: [], total: 0, limit: 20, offset: 0 });
+  const [rawSnapshots, setRawSnapshots] = useState<PagedResult<RawSnapshot>>({ items: [], total: 0, limit: 20, offset: 0 });
+  const [drafts, setDrafts] = useState<PagedResult<Draft>>({ items: [], total: 0, limit: 20, offset: 0 });
+  const [emailHistory, setEmailHistory] = useState<PagedResult<EmailHistory>>({ items: [], total: 0, limit: 20, offset: 0 });
 
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
-  const [selectedDraftId, setSelectedDraftId] = useState<string | null>(null);
   const [selectedProspectId, setSelectedProspectId] = useState<string | null>(null);
+  const [selectedRawSnapshotId, setSelectedRawSnapshotId] = useState<string | null>(null);
+  const [reportModelKind, setReportModelKind] = useState<ReportModelKind>('balanced');
 
-  const [jobsData, setJobsData] = useState<PagedResult<SearchJob>>({ items: [], total: 0, limit: jobLimit, offset: 0 });
-  const [prospectsData, setProspectsData] = useState<PagedResult<Prospect>>({
-    items: [],
-    total: 0,
-    limit: prospectLimit,
-    offset: 0
-  });
-  const [draftsData, setDraftsData] = useState<PagedResult<Draft>>({ items: [], total: 0, limit: draftLimit, offset: 0 });
-
-  const [safeMode, setSafeMode] = useState<EmailSafeMode | null>(null);
-  const [safeModePreview, setSafeModePreview] = useState<SafeModePreview | null>(null);
-  const [companyReport, setCompanyReport] = useState<ProspectCompanyReport | null>(null);
-  const [companyReportLoading, setCompanyReportLoading] = useState(false);
-
-  const [searchForm, setSearchForm] = useState({
-    companyName: '',
-    region: '',
-    industry: ''
-  });
-
-  const [editDraftForm, setEditDraftForm] = useState({
-    subject: '',
-    bodyText: ''
-  });
-
-  const [safePreviewForm, setSafePreviewForm] = useState({
-    intendedRecipient: '',
-    subject: 'Demo outreach - VNETWORK',
-    bodyText: 'Xin chao Anh/Chi, em xin phep gui de xuat hop tac ngan gon.'
-  });
+  const [report, setReport] = useState<ProspectCompanyReport | null>(null);
+  const [rawFilters, setRawFilters] = useState({ source: '', entityType: '', q: '' });
 
   const fetchJson = useCallback(
     async <T,>(path: string, init?: RequestInit): Promise<T> => {
-      const response = await fetchWithTimeout(
-        `${apiBase}${path}`,
-        {
-          ...init,
-          headers: {
-            'Content-Type': 'application/json',
-            ...(init?.headers ?? {})
-          }
-        },
-        15000
-      );
-
+      const response = await fetch(`${apiBase}${path}`, {
+        ...init,
+        headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) }
+      });
       if (!response.ok) {
         const text = await response.text();
-        throw new ApiError('HTTP', text || `HTTP ${response.status}`, response.status);
+        throw new Error(text || `HTTP ${response.status}`);
       }
-
       return response.json() as Promise<T>;
     },
     [apiBase]
   );
 
-  const selectedJob = useMemo(() => jobsData.items.find((item) => item.id === selectedJobId) ?? null, [jobsData.items, selectedJobId]);
-  const selectedDraft = useMemo(() => draftsData.items.find((item) => item.id === selectedDraftId) ?? null, [draftsData.items, selectedDraftId]);
-  const selectedProspect = useMemo(
-    () => prospectsData.items.find((item) => item.id === selectedProspectId) ?? null,
-    [prospectsData.items, selectedProspectId]
-  );
-
-  const summary = useMemo(() => {
-    const runningJobs = jobsData.items.filter((item) => item.status === 'running').length;
-    const queuedJobs = jobsData.items.filter((item) => item.status === 'queued').length;
-    const pendingDrafts = draftsData.items.filter((item) => item.status === 'pending_review').length;
-    const sentDrafts = draftsData.items.filter((item) => item.status === 'sent').length;
-
-    return {
-      totalJobs: jobsData.total,
-      runningJobs,
-      queuedJobs,
-      totalProspects: prospectsData.total,
-      pendingDrafts,
-      sentDrafts
-    };
-  }, [jobsData, prospectsData, draftsData]);
+  const selectedProspect = useMemo(() => prospects.items.find((item) => item.id === selectedProspectId) ?? null, [prospects.items, selectedProspectId]);
+  const selectedRawSnapshot = useMemo(() => rawSnapshots.items.find((item) => item.id === selectedRawSnapshotId) ?? null, [rawSnapshots.items, selectedRawSnapshotId]);
 
   const loadJobs = useCallback(async () => {
-    const params = new URLSearchParams();
-    params.set('limit', String(jobLimit));
-    params.set('offset', String((jobPage - 1) * jobLimit));
-    if (jobStatusFilter !== 'all') params.set('status', jobStatusFilter);
-    if (jobQuery.trim()) params.set('q', jobQuery.trim());
-
-    const result = await fetchJson<PagedResult<SearchJob>>(`/p1/search-jobs?${params.toString()}`);
-    setJobsData(result);
-
-    if (!result.items.length) {
-      setSelectedJobId(null);
-      return;
-    }
-
-    if (!selectedJobId || !result.items.some((item) => item.id === selectedJobId)) {
-      setSelectedJobId(result.items[0].id);
-    }
-  }, [fetchJson, jobLimit, jobPage, jobQuery, jobStatusFilter, selectedJobId]);
+    const result = await fetchJson<PagedResult<SearchJob>>('/p1/search-jobs?limit=10&offset=0');
+    setJobs(result);
+    if (!selectedJobId && result.items.length) setSelectedJobId(result.items[0].id);
+  }, [fetchJson, selectedJobId]);
 
   const loadProspects = useCallback(async () => {
-    const params = new URLSearchParams();
-    params.set('limit', String(prospectLimit));
-    params.set('offset', String((prospectPage - 1) * prospectLimit));
-    if (selectedJobId) params.set('searchJobId', selectedJobId);
-    if (prospectStatusFilter !== 'all') params.set('status', prospectStatusFilter);
-    if (prospectQuery.trim()) params.set('q', prospectQuery.trim());
+    if (!selectedJobId) {
+      setProspects({ items: [], total: 0, limit: 20, offset: 0 });
+      return;
+    }
+    const result = await fetchJson<PagedResult<Prospect>>(`/p1/prospects?searchJobId=${encodeURIComponent(selectedJobId)}&limit=20&offset=0`);
+    setProspects(result);
+    if (!selectedProspectId && result.items.length) setSelectedProspectId(result.items[0].id);
+  }, [fetchJson, selectedJobId, selectedProspectId]);
 
-    const result = await fetchJson<PagedResult<Prospect>>(`/p1/prospects?${params.toString()}`);
-    setProspectsData(result);
-
-    if (!result.items.length) {
-      setSelectedProspectId(null);
-      setCompanyReport(null);
+  const loadRawSnapshots = useCallback(async () => {
+    if (!selectedJobId) {
+      setRawSnapshots({ items: [], total: 0, limit: 20, offset: 0 });
+      setSelectedRawSnapshotId(null);
       return;
     }
 
-    if (!selectedProspectId || !result.items.some((item) => item.id === selectedProspectId)) {
-      setSelectedProspectId(result.items[0].id);
-    }
-  }, [fetchJson, prospectLimit, prospectPage, prospectQuery, prospectStatusFilter, selectedJobId, selectedProspectId]);
+    const params = new URLSearchParams();
+    params.set('limit', '20');
+    params.set('offset', '0');
+    if (rawFilters.source.trim()) params.set('source', rawFilters.source.trim());
+    if (rawFilters.entityType.trim()) params.set('entityType', rawFilters.entityType.trim());
+    if (rawFilters.q.trim()) params.set('q', rawFilters.q.trim());
+
+    const result = await fetchJson<PagedResult<RawSnapshot>>(`/p1/search-jobs/${encodeURIComponent(selectedJobId)}/raw-snapshots?${params.toString()}`);
+    setRawSnapshots(result);
+    if (!selectedRawSnapshotId && result.items.length) setSelectedRawSnapshotId(result.items[0].id);
+  }, [fetchJson, rawFilters.entityType, rawFilters.q, rawFilters.source, selectedJobId, selectedRawSnapshotId]);
 
   const loadDrafts = useCallback(async () => {
-    const params = new URLSearchParams();
-    params.set('limit', String(draftLimit));
-    params.set('offset', String((draftPage - 1) * draftLimit));
-    if (draftStatusFilter !== 'all') params.set('status', draftStatusFilter);
-
-    const result = await fetchJson<PagedResult<Draft>>(`/p1/drafts?${params.toString()}`);
-    setDraftsData(result);
-
-    if (!result.items.length) {
-      setSelectedDraftId(null);
-      return;
-    }
-
-    if (!selectedDraftId || !result.items.some((item) => item.id === selectedDraftId)) {
-      const picked = result.items[0];
-      setSelectedDraftId(picked.id);
-      setEditDraftForm({ subject: picked.subject, bodyText: picked.body_text });
-    }
-  }, [fetchJson, draftLimit, draftPage, draftStatusFilter, selectedDraftId]);
-
-  const loadSafeMode = useCallback(async () => {
-    const result = await fetchJson<EmailSafeMode>('/p1/email-safe-mode');
-    setSafeMode(result);
+    const result = await fetchJson<PagedResult<Draft>>('/p1/drafts?limit=20&offset=0');
+    setDrafts(result);
   }, [fetchJson]);
 
-  const loadAll = useCallback(
-    async (silent?: boolean) => {
-      if (!silent) setLoading(true);
-      setErrorText(null);
+  const loadEmailHistory = useCallback(async () => {
+    const result = await fetchJson<PagedResult<EmailHistory>>('/p1/email-history?limit=20&offset=0');
+    setEmailHistory(result);
+  }, [fetchJson]);
 
-      try {
-        await Promise.all([loadJobs(), loadProspects(), loadDrafts(), loadSafeMode()]);
-        setLastUpdatedAt(new Date().toISOString());
-      } catch (error) {
-        setErrorText(normalizeError(error).message);
-      } finally {
-        if (!silent) setLoading(false);
-      }
-    },
-    [loadDrafts, loadJobs, loadProspects, loadSafeMode]
-  );
-
-  useEffect(() => {
-    if (typeof window === 'undefined') {
-      setDetectingApiBase(false);
-      return;
+  const refreshAll = useCallback(async () => {
+    setLoading(true);
+    setErrorText(null);
+    try {
+      await loadJobs();
+      await loadProspects();
+      await loadRawSnapshots();
+      await loadDrafts();
+      await loadEmailHistory();
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : 'Không thể tải dữ liệu');
+    } finally {
+      setLoading(false);
     }
-
-    let cancelled = false;
-    const candidates = Array.from(new Set([apiBase, resolveApiBase(), 'http://localhost:4000']));
-
-    async function detect(): Promise<void> {
-      for (const candidate of candidates) {
-        try {
-          const res = await fetchWithTimeout(`${candidate.replace(/\/$/, '')}/health`, { method: 'GET' }, 6000);
-          if (!res.ok) continue;
-          if (cancelled) return;
-          setApiBase(candidate);
-          setDetectingApiBase(false);
-          return;
-        } catch {
-          continue;
-        }
-      }
-      if (!cancelled) setDetectingApiBase(false);
-    }
-
-    void detect();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [apiBase]);
+  }, [loadDrafts, loadEmailHistory, loadJobs, loadProspects, loadRawSnapshots]);
 
   useEffect(() => {
-    if (detectingApiBase) return;
-    void loadAll();
-  }, [detectingApiBase, loadAll]);
+    void refreshAll();
+  }, [refreshAll]);
 
   useEffect(() => {
-    if (!autoRefresh || detectingApiBase) return;
+    void loadProspects();
+    void loadRawSnapshots();
+  }, [loadProspects, loadRawSnapshots]);
 
-    const timer = window.setInterval(() => {
-      if (!document.hidden) {
-        void loadAll(true);
-      }
-    }, 5000);
-
-    return () => window.clearInterval(timer);
-  }, [autoRefresh, detectingApiBase, loadAll]);
-
-  useEffect(() => {
-    if (!selectedDraft) return;
-    setEditDraftForm({ subject: selectedDraft.subject, bodyText: selectedDraft.body_text });
-  }, [selectedDraft]);
-
-  async function handleCreateSearchJob(event: FormEvent<HTMLFormElement>): Promise<void> {
+  async function handleCreateSearch(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     setErrorText(null);
     setNotice(null);
 
     try {
-      const result = await fetchJson<{ jobId: string }>('/p1/search-jobs', {
+      const created = await fetchJson<{ jobId: string }>('/p1/search-jobs', {
         method: 'POST',
         body: JSON.stringify({
           companyName: searchForm.companyName,
@@ -443,635 +231,387 @@ export default function WorkspacePage() {
         })
       });
 
-      setSearchForm((prev) => ({ ...prev, companyName: '' }));
-      setSelectedJobId(result.jobId);
-      setJobPage(1);
-      setProspectPage(1);
-      await loadAll();
-      setNotice(`Da tao search job ${result.jobId.slice(0, 8)}...`);
+      setSearchForm({ companyName: '', region: '', industry: '' });
+      setSelectedJobId(created.jobId);
+      await refreshAll();
+      setNotice(`Đã tạo job ${created.jobId.slice(0, 8)}...`);
     } catch (error) {
-      setErrorText(normalizeError(error).message);
+      setErrorText(error instanceof Error ? error.message : 'Không tạo được search job');
     }
   }
 
-  async function handleRetryJob(id: string): Promise<void> {
-    setErrorText(null);
-    setNotice(null);
-    try {
-      await fetchJson(`/p1/search-jobs/${id}/retry`, { method: 'POST' });
-      await loadAll();
-      setNotice(`Da retry search job ${id.slice(0, 8)}...`);
-    } catch (error) {
-      setErrorText(normalizeError(error).message);
-    }
-  }
-
-  async function handleUpdateProspectStatus(
-    id: string,
-    status: 'new' | 'qualified' | 'contacted' | 'meeting' | 'disqualified' | 'archived'
-  ): Promise<void> {
+  async function handleGenerateAndSaveReport(): Promise<void> {
+    if (!selectedProspectId) return;
+    setLoading(true);
     setErrorText(null);
     setNotice(null);
 
     try {
-      await fetchJson(`/p1/prospects/${id}/status`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status, actor: 'sales-operator' })
-      });
-      await loadProspects();
-      setNotice(`Da cap nhat prospect -> ${status}`);
-    } catch (error) {
-      setErrorText(normalizeError(error).message);
-    }
-  }
-
-  async function handleGenerateDraft(prospectId: string): Promise<void> {
-    setErrorText(null);
-    setNotice(null);
-
-    try {
-      const result = await fetchJson<{ draftId: string }>(`/p1/prospects/${prospectId}/generate-draft`, {
-        method: 'POST'
-      });
-      await loadDrafts();
-      setSelectedDraftId(result.draftId);
-      setNotice(`Da tao draft ${result.draftId.slice(0, 8)}...`);
-    } catch (error) {
-      setErrorText(normalizeError(error).message);
-    }
-  }
-
-  async function handleLoadCompanyReport(prospectId: string): Promise<void> {
-    setCompanyReportLoading(true);
-    setErrorText(null);
-
-    try {
-      const result = await fetchJson<ProspectCompanyReport>(`/p1/prospects/${prospectId}/report`);
-      setCompanyReport(result);
-      setSelectedProspectId(prospectId);
-      setNotice('Da tai AI report hien co.');
-    } catch (error) {
-      setCompanyReport(null);
-      setErrorText(normalizeError(error).message);
-    } finally {
-      setCompanyReportLoading(false);
-    }
-  }
-
-  async function handleGenerateCompanyReport(prospectId: string): Promise<void> {
-    setCompanyReportLoading(true);
-    setErrorText(null);
-    setNotice(null);
-
-    try {
-      const result = await fetchJson<ProspectCompanyReport>(`/p1/prospects/${prospectId}/report`, {
-        method: 'POST'
-      });
-      setCompanyReport(result);
-      setSelectedProspectId(prospectId);
-      setNotice(`Da tao AI report (${result.provider}) cho prospect ${prospectId.slice(0, 8)}...`);
-    } catch (error) {
-      setCompanyReport(null);
-      setErrorText(normalizeError(error).message);
-    } finally {
-      setCompanyReportLoading(false);
-    }
-  }
-
-  async function handleReviewDraft(action: 'approve' | 'reject' | 'edit'): Promise<void> {
-    if (!selectedDraft) return;
-    setErrorText(null);
-    setNotice(null);
-
-    try {
-      const payload: Record<string, unknown> = {
-        action,
-        reviewer: 'web-demo'
-      };
-
-      if (action === 'edit') {
-        payload.subject = editDraftForm.subject;
-        payload.bodyText = editDraftForm.bodyText;
-      }
-
-      if (action === 'reject') {
-        payload.rejectReason = 'rejected_from_web_demo';
-      }
-
-      await fetchJson(`/p1/drafts/${selectedDraft.id}/review`, {
+      const saved = await fetchJson<ProspectCompanyReport>(`/p1/prospects/${selectedProspectId}/report`, {
         method: 'POST',
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ modelKind: reportModelKind })
       });
-
-      await loadDrafts();
-      setNotice(`Da ${action} draft ${selectedDraft.id.slice(0, 8)}...`);
+      setReport(saved);
+      setNotice(`Đã xuất report (${saved.provider}, mode=${reportModelKind}) lúc ${formatDate(saved.generated_at)}.`);
     } catch (error) {
-      setErrorText(normalizeError(error).message);
+      setErrorText(error instanceof Error ? error.message : 'Không tạo được report');
+    } finally {
+      setLoading(false);
     }
   }
 
-  async function handleSafeModePreview(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
+  async function handleGenerateDraft(): Promise<void> {
+    if (!selectedProspectId) return;
+    setLoading(true);
     setErrorText(null);
     setNotice(null);
 
     try {
-      const result = await fetchJson<SafeModePreview>('/p1/email-safe-mode/preview', {
-        method: 'POST',
-        body: JSON.stringify({
-          intendedRecipient: safePreviewForm.intendedRecipient,
-          subject: safePreviewForm.subject,
-          bodyText: safePreviewForm.bodyText,
-          draftId: selectedDraft?.id ?? 'WEB-PREVIEW'
-        })
-      });
-      setSafeModePreview(result);
-      setNotice('Da tao safe-mode preview.');
+      const result = await fetchJson<{ draftId: string }>(`/p1/prospects/${selectedProspectId}/generate-draft`, { method: 'POST' });
+      await loadDrafts();
+      setNotice(`Đã tạo draft ${result.draftId.slice(0, 8)} và gửi card review qua Telegram.`);
     } catch (error) {
-      setErrorText(normalizeError(error).message);
+      setErrorText(error instanceof Error ? error.message : 'Không tạo được draft');
+    } finally {
+      setLoading(false);
     }
   }
 
-  const jobTotalPages = totalPages(jobsData.total, jobLimit);
-  const prospectTotalPages = totalPages(prospectsData.total, prospectLimit);
-  const draftTotalPages = totalPages(draftsData.total, draftLimit);
+  async function handleDownloadLatex(): Promise<void> {
+    if (!selectedProspectId) return;
+    try {
+      const response = await fetch(`${apiBase}/p1/prospects/${selectedProspectId}/report/latex`);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { filename: string; content: string };
+      const blob = new Blob([payload.content], { type: 'application/x-tex;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = payload.filename || 'company-report.tex';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : 'Không tải được file LaTeX');
+    }
+  }
+
+  async function handleDownloadPdf(): Promise<void> {
+    if (!selectedProspectId) return;
+    try {
+      const response = await fetch(`${apiBase}/p1/prospects/${selectedProspectId}/report/pdf`);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `HTTP ${response.status}`);
+      }
+      const payload = (await response.json()) as { filename: string; contentBase64: string };
+      const binary = atob(payload.contentBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = payload.filename || 'company-report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : 'Không tải được file PDF');
+    }
+  }
+
+  function handleExportReportPdf(): void {
+    if (!report) return;
+
+    const reportText = report.report_markdown ?? '';
+    const content = reportText
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('\n', '<br/>');
+
+    const popup = window.open('', '_blank', 'noopener,noreferrer,width=980,height=760');
+    if (!popup) {
+      setErrorText('Trình duyệt đã chặn popup. Hãy cho phép popup để xuất PDF.');
+      return;
+    }
+
+    const html = `<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Company Report - ${report.company_name}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #122238; }
+    h1 { margin: 0 0 8px; font-size: 26px; }
+    .meta { margin: 0 0 16px; color: #4a5f80; font-size: 13px; }
+    .card { border: 1px solid #dbe4f2; border-radius: 10px; padding: 16px; background: #fff; }
+    .report { line-height: 1.6; font-size: 14px; white-space: normal; }
+    @page { size: A4; margin: 14mm; }
+  </style>
+</head>
+<body>
+  <h1>AI Company Report</h1>
+  <p class="meta">Company: ${report.company_name} | Provider: ${report.provider} | Generated: ${formatDate(report.generated_at)}</p>
+  <div class="card report">${content}</div>
+</body>
+</html>`;
+
+    popup.document.open();
+    popup.document.write(html);
+    popup.document.close();
+    popup.focus();
+    popup.print();
+  }
 
   return (
     <main className="page">
-      <div className="container workspaceContainer">
-        <header className="hero" id="tong-quan">
+      <div className="container">
+        <section className="hero">
           <div>
-            <p className="eyebrow">SC-02 / SC-03 / SC-04 / SC-07 / SC-08</p>
-            <h1>AI Sales Agent - Demo Workspace</h1>
-            <p>
-              Dashboard demo ngay mai: nhap company, chay discovery that, sinh draft bang AI, duyet qua web/telegram,
-              va gui theo Safe Mode ve inbox test.
-            </p>
+            <p className="eyebrow">VNETWORK Sales Platform</p>
+            <h1>Full Flow: Discovery → Report → Telegram Review → Send</h1>
+            <p>Bản draft được duyệt và chỉnh sửa qua Telegram Bot theo nghiệp vụ CEO/Sales. Web chỉ theo dõi trạng thái.</p>
           </div>
-
           <label className="apiBox">
             <span>API Base URL</span>
             <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
-            <small>{detectingApiBase ? 'Dang tu do API...' : `Dang dung: ${apiBase}`}</small>
           </label>
-        </header>
+        </section>
 
         {errorText ? <div className="alert">{errorText}</div> : null}
         {notice ? <div className="successAlert">{notice}</div> : null}
 
-        <section className="cards workspaceKpis">
-          <article className="card">
-            <h2>Jobs Today</h2>
-            <strong>{summary.totalJobs}</strong>
-          </article>
-          <article className="card">
-            <h2>Running</h2>
-            <strong>{summary.runningJobs}</strong>
-          </article>
-          <article className="card">
-            <h2>Draft Pending</h2>
-            <strong>{summary.pendingDrafts}</strong>
-          </article>
-          <article className="card">
-            <h2>Sent</h2>
-            <strong>{summary.sentDrafts}</strong>
-          </article>
-        </section>
-
-        <section className="statusRow">
-          <label className="switchRow">
-            <input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} />
-            <span>Auto refresh 5s</span>
-          </label>
-          <p>
-            Last update: {formatDate(lastUpdatedAt)} | Prospects: {summary.totalProspects}
-          </p>
-        </section>
-
-        <section className="workspaceMainGrid" id="jobs-section">
+        <section className="workspaceMainGrid">
           <article className="panel workspaceColumnLeft">
-            <h3>SC-03 New Search</h3>
-            <form onSubmit={handleCreateSearchJob} className="workspaceFormGrid">
-              <input
-                placeholder="Ten cong ty *"
-                value={searchForm.companyName}
-                onChange={(event) => setSearchForm((prev) => ({ ...prev, companyName: event.target.value }))}
-                required
-              />
-              <input
-                placeholder="Region (tuy chon)"
-                value={searchForm.region}
-                onChange={(event) => setSearchForm((prev) => ({ ...prev, region: event.target.value }))}
-              />
-              <input
-                placeholder="Industry (tuy chon)"
-                value={searchForm.industry}
-                onChange={(event) => setSearchForm((prev) => ({ ...prev, industry: event.target.value }))}
-              />
-              <button type="submit">Bat dau tim</button>
+            <h3>Tạo Search Job</h3>
+            <form onSubmit={handleCreateSearch} className="workspaceFormGrid">
+              <input placeholder="Tên công ty *" value={searchForm.companyName} onChange={(event) => setSearchForm((prev) => ({ ...prev, companyName: event.target.value }))} required />
+              <input placeholder="Region" value={searchForm.region} onChange={(event) => setSearchForm((prev) => ({ ...prev, region: event.target.value }))} />
+              <input placeholder="Industry" value={searchForm.industry} onChange={(event) => setSearchForm((prev) => ({ ...prev, industry: event.target.value }))} />
+              <button type="submit">Bắt đầu tìm</button>
+              <button type="button" className="ghostAction" onClick={() => void refreshAll()} disabled={loading}>{loading ? 'Đang tải...' : 'Làm mới dữ liệu'}</button>
             </form>
-
-            <div className="detailBox">
-              <h4>Safe Mode Email</h4>
-              <p>
-                {safeMode
-                  ? `External send: ${String(safeMode.enableExternalSend)} | Redirect: ${safeMode.outboundRedirectTarget}`
-                  : 'Dang tai safe mode config...' }
-              </p>
-              <p>
-                Allowlist: {safeMode?.smtpAllowlistDomains?.join(', ') || '-'}
-              </p>
-            </div>
           </article>
 
           <article className="panel">
-            <div className="panelHead">
-              <h3>SC-04 Search Jobs</h3>
-              <button onClick={() => void loadAll()} disabled={loading}>{loading ? 'Dang tai...' : 'Lam moi'}</button>
-            </div>
-
-            <div className="toolbar">
-              <input
-                placeholder="Tim theo company"
-                value={jobQuery}
-                onChange={(event) => {
-                  setJobPage(1);
-                  setJobQuery(event.target.value);
-                }}
-              />
-              <select
-                value={jobStatusFilter}
-                onChange={(event) => {
-                  setJobPage(1);
-                  setJobStatusFilter(event.target.value as typeof jobStatusFilter);
-                }}
-              >
-                <option value="all">All status</option>
-                <option value="queued">Queued</option>
-                <option value="running">Running</option>
-                <option value="completed">Completed</option>
-                <option value="failed">Failed</option>
-              </select>
-              <select
-                value={String(jobLimit)}
-                onChange={(event) => {
-                  setJobLimit(Number(event.target.value));
-                  setJobPage(1);
-                }}
-              >
-                {jobPageSizes.map((size) => (
-                  <option key={size} value={size}>{size}/page</option>
-                ))}
-              </select>
-            </div>
-
+            <div className="panelHead"><h3>Search Jobs</h3><span>{jobs.total} jobs</span></div>
             <div className="tableWrap">
               <table>
-                <thead>
-                  <tr>
-                    <th>Company Query</th>
-                    <th>Region</th>
-                    <th>Industry</th>
-                    <th>Status</th>
-                    <th>Prospects</th>
-                    <th>Created</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>Company</th><th>Status</th><th>Prospects</th><th>Created</th></tr></thead>
                 <tbody>
-                  {jobsData.items.length === 0 ? (
-                    <tr><td colSpan={6}>Chua co job.</td></tr>
-                  ) : (
-                    jobsData.items.map((job) => (
-                      <tr
-                        key={job.id}
-                        className={selectedJobId === job.id ? 'selected' : ''}
-                        onClick={() => {
-                          setSelectedJobId(job.id);
-                          setProspectPage(1);
-                        }}
-                      >
-                        <td>{job.keyword}</td>
-                        <td>{job.region ?? '-'}</td>
-                        <td>{job.industry ?? '-'}</td>
-                        <td><span className={`statusBadge status-${job.status}`}>{jobStatusLabel(job.status)}</span></td>
-                        <td>{job.total_prospects}</td>
-                        <td>{formatDate(job.created_at)}</td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="pager">
-              <button disabled={jobPage <= 1} onClick={() => setJobPage((prev) => prev - 1)}>Prev</button>
-              <span>Page {jobPage}/{jobTotalPages} ({jobsData.total})</span>
-              <button disabled={jobPage >= jobTotalPages} onClick={() => setJobPage((prev) => prev + 1)}>Next</button>
-            </div>
-
-            {selectedJob ? (
-              <div className="detailBox">
-                <h4>Selected Job</h4>
-                <p><strong>ID:</strong> {selectedJob.id}</p>
-                <p><strong>Status:</strong> {jobStatusLabel(selectedJob.status)}</p>
-                <p><strong>Timeline:</strong> {formatDate(selectedJob.started_at)} {'->'} {formatDate(selectedJob.completed_at)}</p>
-                {selectedJob.error_message ? <p><strong>Error:</strong> {selectedJob.error_message}</p> : null}
-                {selectedJob.status === 'failed' ? (
-                  <div className="jobActions"><button onClick={() => void handleRetryJob(selectedJob.id)}>Retry</button></div>
-                ) : null}
-              </div>
-            ) : null}
-          </article>
-        </section>
-
-        <section className="panel" id="prospects-section" style={{ marginTop: '0.9rem' }}>
-          <h3>SC-05 Prospect Pipeline {selectedJobId ? `(job ${selectedJobId.slice(0, 8)}...)` : ''}</h3>
-
-          <div className="toolbar toolbarWide">
-            <input
-              placeholder="Tim company/person/email"
-              value={prospectQuery}
-              onChange={(event) => {
-                setProspectPage(1);
-                setProspectQuery(event.target.value);
-              }}
-            />
-            <select
-              value={prospectStatusFilter}
-              onChange={(event) => {
-                setProspectPage(1);
-                setProspectStatusFilter(event.target.value as typeof prospectStatusFilter);
-              }}
-            >
-              <option value="all">All status</option>
-              <option value="new">new</option>
-              <option value="qualified">qualified</option>
-              <option value="contacted">contacted</option>
-              <option value="meeting">meeting</option>
-              <option value="disqualified">disqualified</option>
-              <option value="archived">archived</option>
-            </select>
-            <select
-              value={String(prospectLimit)}
-              onChange={(event) => {
-                setProspectLimit(Number(event.target.value));
-                setProspectPage(1);
-              }}
-            >
-              {prospectPageSizes.map((size) => (
-                <option key={size} value={size}>{size}/page</option>
-              ))}
-            </select>
-          </div>
-
-          <div className="tableWrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Company</th>
-                  <th>Person</th>
-                  <th>Email</th>
-                  <th>Status</th>
-                  <th>Source</th>
-                  <th>Updated</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {prospectsData.items.length === 0 ? (
-                  <tr><td colSpan={7}>Chua co prospect.</td></tr>
-                ) : (
-                  prospectsData.items.map((prospect) => (
-                    <tr
-                      key={prospect.id}
-                      className={selectedProspectId === prospect.id ? 'selected' : ''}
-                      onClick={() => setSelectedProspectId(prospect.id)}
-                    >
-                      <td>{prospect.company}</td>
-                      <td>{prospect.person_name}</td>
-                      <td>{prospect.email ?? '-'}</td>
-                      <td>{prospect.status}</td>
-                      <td>{prospect.source}</td>
-                      <td>{formatDate(prospect.created_at)}</td>
-                      <td>
-                        <div className="inlineActions">
-                          <select
-                            value={prospect.status}
-                            onChange={(event) =>
-                              void handleUpdateProspectStatus(
-                                prospect.id,
-                                event.target.value as
-                                  | 'new'
-                                  | 'qualified'
-                                  | 'contacted'
-                                  | 'meeting'
-                                  | 'disqualified'
-                                  | 'archived'
-                              )
-                            }
-                          >
-                            <option value="new">new</option>
-                            <option value="qualified">qualified</option>
-                            <option value="contacted">contacted</option>
-                            <option value="meeting">meeting</option>
-                            <option value="disqualified">disqualified</option>
-                            <option value="archived">archived</option>
-                          </select>
-                          <button className="smallBtn" onClick={() => void handleGenerateDraft(prospect.id)}>Generate Draft</button>
-                          <button className="smallBtn" onClick={() => void handleLoadCompanyReport(prospect.id)}>Load Report</button>
-                          <button className="smallBtn" onClick={() => void handleGenerateCompanyReport(prospect.id)}>AI Report</button>
-                        </div>
-                      </td>
+                  {!jobs.items.length ? <tr><td colSpan={4}>Chưa có job.</td></tr> : jobs.items.map((job) => (
+                    <tr key={job.id} className={selectedJobId === job.id ? 'selected' : ''} onClick={() => setSelectedJobId(job.id)}>
+                      <td>{job.keyword}</td>
+                      <td><span className={`statusBadge status-${job.status}`}>{job.status}</span></td>
+                      <td>{job.total_prospects}</td>
+                      <td>{formatDate(job.created_at)}</td>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="pager">
-            <button disabled={prospectPage <= 1} onClick={() => setProspectPage((prev) => prev - 1)}>Prev</button>
-            <span>Page {prospectPage}/{prospectTotalPages} ({prospectsData.total})</span>
-            <button disabled={prospectPage >= prospectTotalPages} onClick={() => setProspectPage((prev) => prev + 1)}>Next</button>
-          </div>
-        </section>
-
-        <section className="panel companyReportPanel" style={{ marginTop: '0.9rem' }}>
-          <div className="panelHead">
-            <h3>AI Company Report</h3>
-            {selectedProspect ? (
-              <div className="inlineActions">
-                <button className="smallBtn" onClick={() => void handleLoadCompanyReport(selectedProspect.id)} disabled={companyReportLoading}>
-                  {companyReportLoading ? 'Loading...' : 'Load'}
-                </button>
-                <button className="smallBtn" onClick={() => void handleGenerateCompanyReport(selectedProspect.id)} disabled={companyReportLoading}>
-                  {companyReportLoading ? 'Generating...' : 'Generate/Refresh'}
-                </button>
-              </div>
-            ) : null}
-          </div>
-
-          {selectedProspect ? (
-            <p className="notice" style={{ marginTop: '0.4rem' }}>
-              Prospect: <strong>{selectedProspect.company}</strong> - {selectedProspect.person_name} ({selectedProspect.email ?? 'no-email'})
-            </p>
-          ) : (
-            <p className="notice">Chon 1 prospect de xem hoac tao bao cao AI.</p>
-          )}
-
-          {companyReport ? (
-            <div>
-              <div className="reportMeta">
-                <span>Provider: {companyReport.provider}</span>
-                <span>Generated: {formatDate(companyReport.generated_at)}</span>
-                <span>Sources: {companyReport.source_count}</span>
-                <span>Score: {companyReport.confidence_score ?? 'N/A'}</span>
-              </div>
-              <pre className="payloadBox reportMarkdown">{companyReport.report_markdown}</pre>
-            </div>
-          ) : (
-            <p className="notice">Chua co report. Bam Generate/Refresh de AI tong hop bao cao cong ty.</p>
-          )}
-        </section>
-
-        <section className="workspaceBottomGrid" style={{ marginTop: '0.9rem' }}>
-          <article className="panel">
-            <div className="panelHead">
-              <h3>SC-07 Draft Inbox</h3>
-              <span className="eyebrow" style={{ margin: 0 }}>Review Queue</span>
-            </div>
-
-            <div className="toolbar">
-              <input disabled value="Email channel" />
-              <select
-                value={draftStatusFilter}
-                onChange={(event) => {
-                  setDraftPage(1);
-                  setDraftStatusFilter(event.target.value as typeof draftStatusFilter);
-                }}
-              >
-                <option value="all">All drafts</option>
-                <option value="pending_review">pending_review</option>
-                <option value="approved">approved</option>
-                <option value="rejected">rejected</option>
-                <option value="sent">sent</option>
-              </select>
-              <select
-                value={String(draftLimit)}
-                onChange={(event) => {
-                  setDraftLimit(Number(event.target.value));
-                  setDraftPage(1);
-                }}
-              >
-                {draftPageSizes.map((size) => (
-                  <option key={size} value={size}>{size}/page</option>
-                ))}
-              </select>
-            </div>
-
-            <div className="tableWrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Draft</th>
-                    <th>Status</th>
-                    <th>Mode</th>
-                    <th>Edits</th>
-                    <th>Created</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {draftsData.items.length === 0 ? (
-                    <tr><td colSpan={5}>Chua co draft.</td></tr>
-                  ) : (
-                    draftsData.items.map((draft) => (
-                      <tr key={draft.id} className={selectedDraftId === draft.id ? 'selected' : ''} onClick={() => setSelectedDraftId(draft.id)}>
-                        <td>{draft.id.slice(0, 8)}...</td>
-                        <td>{draftStatusLabel(draft.status)}</td>
-                        <td>{draft.compose_mode}</td>
-                        <td>{draft.edit_count}</td>
-                        <td>{formatDate(draft.created_at)}</td>
-                      </tr>
-                    ))
-                  )}
+                  ))}
                 </tbody>
               </table>
             </div>
-
-            <div className="pager">
-              <button disabled={draftPage <= 1} onClick={() => setDraftPage((prev) => prev - 1)}>Prev</button>
-              <span>Page {draftPage}/{draftTotalPages} ({draftsData.total})</span>
-              <button disabled={draftPage >= draftTotalPages} onClick={() => setDraftPage((prev) => prev + 1)}>Next</button>
-            </div>
-          </article>
-
-          <article className="panel">
-            <h3>SC-08 Draft Editor / Review</h3>
-            {selectedDraft ? (
-              <div className="draftEditor">
-                <label>
-                  Subject
-                  <input
-                    value={editDraftForm.subject}
-                    onChange={(event) => setEditDraftForm((prev) => ({ ...prev, subject: event.target.value }))}
-                  />
-                </label>
-
-                <label>
-                  Body Text
-                  <textarea
-                    value={editDraftForm.bodyText}
-                    onChange={(event) => setEditDraftForm((prev) => ({ ...prev, bodyText: event.target.value }))}
-                  />
-                </label>
-
-                <div className="inlineActions">
-                  <button onClick={() => void handleReviewDraft('edit')}>Save Edit</button>
-                  <button onClick={() => void handleReviewDraft('approve')}>Approve</button>
-                  <button className="dangerBtn" onClick={() => void handleReviewDraft('reject')}>Reject</button>
-                </div>
-
-                <div className="detailBox">
-                  <p><strong>Status:</strong> {draftStatusLabel(selectedDraft.status)}</p>
-                  <p><strong>Approved At:</strong> {formatDate(selectedDraft.approved_at)}</p>
-                  <p><strong>Sent At:</strong> {formatDate(selectedDraft.sent_at)}</p>
-                  {selectedDraft.reject_reason ? <p><strong>Reject Reason:</strong> {selectedDraft.reject_reason}</p> : null}
-                </div>
-              </div>
-            ) : (
-              <p>Chon mot draft de review.</p>
-            )}
           </article>
         </section>
 
         <section className="panel" style={{ marginTop: '0.9rem' }}>
-          <h3>Email Safe Mode Preview</h3>
-          <form className="safePreviewForm" onSubmit={handleSafeModePreview}>
-            <input
-              placeholder="Intended recipient"
-              value={safePreviewForm.intendedRecipient}
-              onChange={(event) => setSafePreviewForm((prev) => ({ ...prev, intendedRecipient: event.target.value }))}
-              required
-            />
-            <input
-              placeholder="Subject"
-              value={safePreviewForm.subject}
-              onChange={(event) => setSafePreviewForm((prev) => ({ ...prev, subject: event.target.value }))}
-              required
-            />
-            <textarea
-              placeholder="Body text"
-              value={safePreviewForm.bodyText}
-              onChange={(event) => setSafePreviewForm((prev) => ({ ...prev, bodyText: event.target.value }))}
-            />
-            <button type="submit">Preview Redirect</button>
-          </form>
+          <div className="panelHead"><h3>Raw Crawl Data</h3><span>{rawSnapshots.total} bản ghi</span></div>
+          <div className="toolbar">
+            <input placeholder="source" value={rawFilters.source} onChange={(event) => setRawFilters((prev) => ({ ...prev, source: event.target.value }))} />
+            <input placeholder="entity type" value={rawFilters.entityType} onChange={(event) => setRawFilters((prev) => ({ ...prev, entityType: event.target.value }))} />
+            <button onClick={() => void loadRawSnapshots()} disabled={!selectedJobId || loading}>Lọc dữ liệu</button>
+          </div>
+          <div className="tableWrap">
+            <table>
+              <thead><tr><th>Source</th><th>Entity Type</th><th>Entity Id</th><th>Created</th></tr></thead>
+              <tbody>
+                {!rawSnapshots.items.length ? <tr><td colSpan={4}>Chưa có raw snapshot.</td></tr> : rawSnapshots.items.map((item) => (
+                  <tr key={item.id} className={selectedRawSnapshotId === item.id ? 'selected' : ''} onClick={() => setSelectedRawSnapshotId(item.id)}>
+                    <td>{item.source}</td><td>{item.entity_type}</td><td>{item.entity_id ?? '-'}</td><td>{formatDate(item.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {selectedRawSnapshot ? <pre className="payloadBox" style={{ marginTop: '0.8rem' }}>{JSON.stringify(selectedRawSnapshot.raw_json, null, 2)}</pre> : null}
+        </section>
 
-          {safeModePreview ? (
-            <pre className="payloadBox">{JSON.stringify(safeModePreview, null, 2)}</pre>
-          ) : (
-            <p className="notice">Nhap recipient va subject de xem subject/banner/header sau redirect.</p>
-          )}
+        <section className="panel" style={{ marginTop: '0.9rem' }}>
+          <div className="panelHead"><h3>Prospects</h3><span>{prospects.total} prospects</span></div>
+          <div className="tableWrap">
+            <table>
+              <thead><tr><th>Company</th><th>Person</th><th>Email</th><th>Status</th><th>Source</th></tr></thead>
+              <tbody>
+                {!prospects.items.length ? <tr><td colSpan={5}>Chưa có prospect.</td></tr> : prospects.items.map((prospect) => (
+                  <tr key={prospect.id} className={selectedProspectId === prospect.id ? 'selected' : ''} onClick={() => setSelectedProspectId(prospect.id)}>
+                    <td>{prospect.company}</td><td>{prospect.person_name}</td><td>{prospect.email ?? '-'}</td><td>{prospect.status}</td><td>{prospect.source}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="inlineActions" style={{ marginTop: '0.8rem' }}>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.45rem' }}>
+              <span>Model mode:</span>
+              <select value={reportModelKind} onChange={(event) => setReportModelKind(event.target.value as ReportModelKind)} disabled={loading}>
+                <option value="fast">fast</option>
+                <option value="balanced">balanced (mặc định)</option>
+                <option value="reasoning">reasoning</option>
+              </select>
+            </label>
+            <button onClick={() => void handleGenerateAndSaveReport()} disabled={!selectedProspectId || loading}>Xuất report AI (toàn bộ key persons)</button>
+            <button onClick={() => void handleGenerateDraft()} disabled={!selectedProspectId || loading}>Tạo draft và gửi Telegram review</button>
+          </div>
+          {selectedProspect ? (
+            <p className="notice" style={{ marginTop: '0.7rem' }}>
+              Prospect đã chọn: <strong>{selectedProspect.company}</strong> - {selectedProspect.person_name}
+              <br />
+              <small>Lưu ý: lựa chọn này chỉ là điểm kích hoạt API. Report công ty sẽ tổng hợp tất cả key persons của công ty trong search job hiện tại.</small>
+            </p>
+          ) : null}
+        </section>
+
+        <section className="workspaceBottomGrid" style={{ marginTop: '0.9rem' }}>
+          <article className="panel">
+            <h3>AI Company Report</h3>
+            {report ? (
+              <>
+                <div className="reportMeta">
+                  <span>Provider: {report.provider}</span>
+                  <span>Sources: {report.source_count}</span>
+                  <span>Score: {report.confidence_score ?? 'N/A'}</span>
+                  <button className="ghostAction" onClick={() => void handleDownloadLatex()} type="button">Tải .tex</button>
+                  <button className="ghostAction" onClick={() => void handleDownloadPdf()} type="button">Tải PDF (server)</button>
+                  <button className="ghostAction" onClick={handleExportReportPdf} type="button">Xuất PDF</button>
+                </div>
+                {(() => {
+                  const json = readObj(report.report_json);
+                  if (!json) {
+                    return <pre className="payloadBox reportMarkdown">{report.report_markdown}</pre>;
+                  }
+
+                  const overview = readObj(json.company_overview) ?? {};
+                  const keyPerson = readObj(json.key_person) ?? {};
+                  const allKeyPersonsRaw = Array.isArray(json.all_key_persons) ? json.all_key_persons : [];
+                  const allKeyPersons = allKeyPersonsRaw
+                    .map((item) => readObj(item))
+                    .filter((item): item is Record<string, unknown> => item !== null);
+                  const buyingSignals = readStrArray(json.buying_signals);
+                  const risks = readStrArray(json.risks);
+                  const nextSteps = readStrArray(json.recommended_next_steps);
+                  const dataQuality = readStrArray(json.data_quality_notes);
+
+                  return (
+                    <div className="reportCard">
+                      <h4>Tóm tắt điều hành</h4>
+                      <p>{readStr(json.executive_summary)}</p>
+
+                      <h4>Company Overview</h4>
+                      <div className="reportGrid">
+                        <div><strong>Domain:</strong> {readStr(overview.domain)}</div>
+                        <div><strong>Industry:</strong> {readStr(overview.industry)}</div>
+                        <div><strong>Region:</strong> {readStr(overview.region)}</div>
+                      </div>
+                      <p><strong>Summary:</strong> {readStr(overview.summary)}</p>
+
+                      <h4>Key Person (điểm kích hoạt)</h4>
+                      <div className="reportGrid">
+                        <div><strong>Name:</strong> {readStr(keyPerson.name)}</div>
+                        <div><strong>Title:</strong> {readStr(keyPerson.title)}</div>
+                        <div><strong>Email:</strong> {readStr(keyPerson.email)}</div>
+                        <div><strong>Phone:</strong> {readStr(keyPerson.phone)}</div>
+                      </div>
+
+                      <h4>All Key Persons ({allKeyPersons.length})</h4>
+                      <div className="tableWrap">
+                        <table>
+                          <thead><tr><th>Name</th><th>Title</th><th>Email</th><th>Phone</th><th>Confidence</th><th>Source</th></tr></thead>
+                          <tbody>
+                            {!allKeyPersons.length ? (
+                              <tr><td colSpan={6}>N/A</td></tr>
+                            ) : allKeyPersons.map((item, idx) => (
+                              <tr key={`${readStr(item.name)}-${idx}`}>
+                                <td>{readStr(item.name)}</td>
+                                <td>{readStr(item.title)}</td>
+                                <td>{readStr(item.email)}</td>
+                                <td>{readStr(item.phone)}</td>
+                                <td>{typeof item.confidence_0_1 === 'number' ? Number(item.confidence_0_1).toFixed(2) : 'N/A'}</td>
+                                <td>{readStr(item.source)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <h4>Buying Signals</h4>
+                      <ul>{buyingSignals.length ? buyingSignals.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+
+                      <h4>Risks</h4>
+                      <ul>{risks.length ? risks.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+
+                      <h4>Recommended Next Steps</h4>
+                      <ul>{nextSteps.length ? nextSteps.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+
+                      <h4>Data Quality Notes</h4>
+                      <ul>{dataQuality.length ? dataQuality.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+                    </div>
+                  );
+                })()}
+              </>
+            ) : <p className="notice">Chưa có report.</p>}
+          </article>
+
+          <article className="panel">
+            <h3>Telegram Review Queue (không hiển thị nội dung draft)</h3>
+            <div className="tableWrap">
+              <table>
+                <thead><tr><th>Draft</th><th>Status</th><th>Mode</th><th>Edits</th><th>Created</th><th>Approved</th><th>Sent</th></tr></thead>
+                <tbody>
+                  {!drafts.items.length ? <tr><td colSpan={7}>Chưa có draft.</td></tr> : drafts.items.map((draft) => (
+                    <tr key={draft.id}>
+                      <td>{draft.id.slice(0, 8)}...</td>
+                      <td>{draft.status}</td>
+                      <td>{draft.compose_mode}</td>
+                      <td>{draft.edit_count}</td>
+                      <td>{formatDate(draft.created_at)}</td>
+                      <td>{formatDate(draft.approved_at)}</td>
+                      <td>{formatDate(draft.sent_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="notice" style={{ marginTop: '0.7rem' }}>
+              Chỉnh sửa/approve/reject thực hiện trong Telegram Bot theo đúng quy trình CEO và Sales Team.
+            </p>
+          </article>
+        </section>
+
+        <section className="panel" style={{ marginTop: '0.9rem' }}>
+          <div className="panelHead"><h3>Email History (Safe Mode)</h3><span>{emailHistory.total} bản ghi</span></div>
+          <div className="tableWrap">
+            <table>
+              <thead><tr><th>Status</th><th>Intended</th><th>Actual</th><th>Redirected</th><th>Subject</th><th>Sent</th></tr></thead>
+              <tbody>
+                {!emailHistory.items.length ? <tr><td colSpan={6}>Chưa có email history.</td></tr> : emailHistory.items.map((row) => (
+                  <tr key={row.id}>
+                    <td>{row.status}</td>
+                    <td>{row.intended_recipient}</td>
+                    <td>{row.actual_recipient}</td>
+                    <td>{row.redirected ? 'yes' : 'no'}</td>
+                    <td>{row.subject}</td>
+                    <td>{formatDate(row.sent_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
       </div>
     </main>

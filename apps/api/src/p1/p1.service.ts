@@ -2,13 +2,23 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import { PgService } from '../database/pg.service';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { promisify } from 'util';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { execFile } from 'child_process';
 import {
+  CreateTemplateDto,
   CreateSearchJobDto,
   EmailSafeModePreviewDto,
   ListDraftsQueryDto,
   ReviewDraftDto
+  ,
+  ListTemplateCandidatesQueryDto,
+  ListTemplatesQueryDto,
+  UpdateTemplateDto
 } from './p1.dto';
-import { OpenAiClient, ProspectComposeInput, ProspectRawSnapshot } from '../integrations/openai.client';
+import { OpenAiClient, ProspectComposeInput, ProspectRawSnapshot, TemplateComposeInput } from '../integrations/openai.client';
 import { P1TelegramService } from './p1.telegram.service';
 
 interface SearchJobRecord {
@@ -68,6 +78,28 @@ interface DraftRecord {
   sent_at: string | null;
 }
 
+interface DraftReviewContextRow {
+  draft_id: string;
+  subject: string;
+  body_text: string;
+  company: string | null;
+  person_name: string | null;
+  intended_recipient: string | null;
+}
+
+interface EmailHistoryRecord {
+  id: string;
+  draft_id: string;
+  sender: string;
+  intended_recipient: string;
+  actual_recipient: string;
+  redirected: boolean;
+  subject: string;
+  status: 'sent' | 'failed' | 'bounced' | 'delivered';
+  sent_at: string | null;
+  created_at: string;
+}
+
 interface ProspectForDraft {
   prospect_id: string;
   company_id: string | null;
@@ -76,6 +108,26 @@ interface ProspectForDraft {
   person_name: string;
   person_title: string | null;
   person_email: string | null;
+}
+
+interface EmailTemplateRecord {
+  id: string;
+  industry: string;
+  subject_template: string;
+  body_template: string;
+  version: number;
+}
+
+interface TemplateCandidateRecord {
+  id: string;
+  draft_id: string;
+  template_key: string;
+  subject: string;
+  body_text: string;
+  normalized_body: string;
+  similarity_score: string | null;
+  promoted: boolean;
+  created_at: string;
 }
 
 interface PagedResult<T> {
@@ -103,11 +155,24 @@ interface ProspectCompanyReportRecord {
   company_name: string;
   report_markdown: string;
   report_json: Record<string, unknown>;
-  provider: 'openai' | 'fallback';
+  provider: 'openai' | 'gemini' | 'fallback';
   source_count: number;
   confidence_score: string | null;
   generated_at: string;
   updated_at: string;
+}
+
+interface ProspectCompanyReportDbRow {
+  id: string;
+  prospect_id: string;
+  company_name: string;
+  report_json: Record<string, unknown>;
+  generated_at: string;
+}
+
+interface ProspectCompanyReportListItem extends ProspectCompanyReportRecord {
+  person_name: string | null;
+  person_email: string | null;
 }
 
 interface ProspectReportInputRow {
@@ -129,11 +194,31 @@ interface ProspectReportInputRow {
   ai_notes: string | null;
 }
 
+interface ReportKeyPersonRow {
+  person_name: string;
+  person_title: string | null;
+  person_email: string | null;
+  person_phone: string | null;
+  confidence: string | null;
+  source: string;
+}
+
 interface SnapshotForReportRow {
   source: string;
   entity_type: string;
   entity_id: string | null;
   raw_json: unknown;
+}
+
+interface RawSnapshotRecord {
+  id: string;
+  job_id: string | null;
+  source: string;
+  entity_type: string;
+  entity_id: string | null;
+  raw_json: unknown;
+  content_hash: string | null;
+  created_at: string;
 }
 
 @Injectable()
@@ -146,6 +231,8 @@ export class P1Service {
     @InjectQueue('p1-discovery') private readonly discoveryQueue: Queue,
     @InjectQueue('p1-email-send') private readonly emailSendQueue: Queue
   ) {}
+
+  private readonly execFileAsync = promisify(execFile);
 
   async createSearchJob(dto: CreateSearchJobDto): Promise<{
     jobId: string;
@@ -341,6 +428,118 @@ export class P1Service {
     };
   }
 
+  async listRawSnapshots(
+    searchJobId: string,
+    query: {
+      source?: string;
+      entityType?: string;
+      q?: string;
+      limit?: number;
+      offset?: number;
+    }
+  ): Promise<PagedResult<RawSnapshotRecord>> {
+    const limit = query.limit ?? 20;
+    const offset = query.offset ?? 0;
+    const conditions: string[] = ['job_id = $1'];
+    const params: unknown[] = [searchJobId];
+
+    if (query.source?.trim()) {
+      params.push(query.source.trim());
+      conditions.push(`source = $${params.length}`);
+    }
+
+    if (query.entityType?.trim()) {
+      params.push(query.entityType.trim());
+      conditions.push(`entity_type = $${params.length}`);
+    }
+
+    if (query.q?.trim()) {
+      params.push(`%${query.q.trim()}%`);
+      conditions.push(
+        `(COALESCE(entity_id, '') ILIKE $${params.length} OR COALESCE(raw_text, '') ILIKE $${params.length} OR COALESCE(raw_json::text, '') ILIKE $${params.length})`
+      );
+    }
+
+    const where = `WHERE ${conditions.join(' AND ')}`;
+
+    const countRows = await this.pg.query<{ total: number }>(
+      `SELECT COUNT(*)::int AS total FROM raw_data_snapshots ${where}`,
+      params
+    );
+
+    params.push(limit);
+    params.push(offset);
+
+    const items = await this.pg.query<RawSnapshotRecord>(
+      `SELECT id, job_id, source, entity_type, entity_id, raw_json, content_hash, created_at
+       FROM raw_data_snapshots
+       ${where}
+       ORDER BY created_at DESC
+       LIMIT $${params.length - 1}
+       OFFSET $${params.length}`,
+      params
+    );
+
+    return {
+      items,
+      total: countRows[0]?.total ?? 0,
+      limit,
+      offset
+    };
+  }
+
+  async listProspectReports(query: {
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<PagedResult<ProspectCompanyReportListItem>> {
+    const limit = query.limit ?? 20;
+    const offset = query.offset ?? 0;
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (query.q?.trim()) {
+      params.push(`%${query.q.trim()}%`);
+      conditions.push(
+        `(r.company_name ILIKE $${params.length} OR COALESCE(p.person_name, '') ILIKE $${params.length} OR COALESCE(p.email, '') ILIKE $${params.length})`
+      );
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countRows = await this.pg.query<{ total: number }>(
+      `SELECT COUNT(*)::int AS total
+       FROM prospect_company_reports r
+       LEFT JOIN prospects p ON p.id = r.prospect_id
+       ${where}`,
+      params
+    );
+
+    params.push(limit);
+    params.push(offset);
+
+    const items = await this.pg.query<ProspectCompanyReportListItem>(
+      `SELECT
+         r.*,
+         p.person_name,
+         p.email AS person_email
+       FROM prospect_company_reports r
+       LEFT JOIN prospects p ON p.id = r.prospect_id
+       ${where}
+       ORDER BY r.generated_at DESC
+       LIMIT $${params.length - 1}
+       OFFSET $${params.length}`,
+      params
+    );
+
+    return {
+      items,
+      total: countRows[0]?.total ?? 0,
+      limit,
+      offset
+    };
+  }
+
   async getProspectCompanyReport(prospectId: string): Promise<ProspectCompanyReportRecord> {
     const rows = await this.pg.query<ProspectCompanyReportRecord>(
       `SELECT *
@@ -356,7 +555,37 @@ export class P1Service {
     return rows[0];
   }
 
-  async generateProspectCompanyReport(prospectId: string, actor: string): Promise<ProspectCompanyReportRecord> {
+  async getProspectCompanyReportLatex(
+    prospectId: string
+  ): Promise<{ filename: string; contentType: 'application/x-tex'; content: string }> {
+    const report = await this.getCompanyReportDbRow(prospectId);
+    const latex = this.readReportLatex(report);
+    return {
+      filename: this.buildReportFilename(report.company_name, report.generated_at, 'tex'),
+      contentType: 'application/x-tex',
+      content: latex
+    };
+  }
+
+  async getProspectCompanyReportPdf(
+    prospectId: string
+  ): Promise<{ filename: string; contentType: 'application/pdf'; contentBase64: string }> {
+    const report = await this.getCompanyReportDbRow(prospectId);
+    const latex = this.readReportLatex(report);
+    const pdfBuffer = await this.compileLatexToPdf(latex);
+
+    return {
+      filename: this.buildReportFilename(report.company_name, report.generated_at, 'pdf'),
+      contentType: 'application/pdf',
+      contentBase64: pdfBuffer.toString('base64')
+    };
+  }
+
+  async generateProspectCompanyReport(
+    prospectId: string,
+    actor: string,
+    modelKind: 'fast' | 'balanced' | 'reasoning' = 'balanced'
+  ): Promise<ProspectCompanyReportRecord> {
     const rows = await this.pg.query<ProspectReportInputRow>(
       `SELECT
          p.id AS prospect_id,
@@ -388,6 +617,7 @@ export class P1Service {
     }
 
     const snapshots = await this.loadReportSnapshots(prospect.search_job_id);
+    const relatedKeyPersons = await this.loadReportKeyPersons(prospect.search_job_id, prospect.company_name);
     const promptTemplate = await this.getPromptTemplate('serialize');
     const confidenceValue =
       prospect.ai_confidence_score !== null && prospect.ai_confidence_score !== undefined
@@ -395,6 +625,7 @@ export class P1Service {
         : null;
 
     const report = await this.openAi.generateProspectCompanyReport({
+      modelKind,
       promptTemplate,
       prospect: {
         prospectId: prospect.prospect_id,
@@ -415,8 +646,16 @@ export class P1Service {
         sourceList: this.toStringArray(prospect.ai_source_list),
         notes: prospect.ai_notes
       },
+      relatedKeyPersons,
       snapshots
     });
+
+    const latexSource = this.buildLatexReport(prospect.company_name, report.reportJson, report.provider, snapshots.length, report.confidenceScore);
+    const enrichedReportJson: Record<string, unknown> = {
+      ...report.reportJson,
+      latex_source: latexSource,
+      latex_generated_at: new Date().toISOString()
+    };
 
     const savedRows = await this.pg.query<ProspectCompanyReportRecord>(
       `INSERT INTO prospect_company_reports (
@@ -439,7 +678,7 @@ export class P1Service {
         prospect.search_job_id,
         prospect.company_name,
         report.reportMarkdown,
-        JSON.stringify(report.reportJson),
+        JSON.stringify(enrichedReportJson),
         report.provider,
         snapshots.length,
         report.confidenceScore
@@ -449,6 +688,7 @@ export class P1Service {
     const saved = savedRows[0];
     await this.writeAudit(actor, 'prospect.company_report.generated', 'prospect', prospect.prospect_id, {
       provider: saved.provider,
+      modelKind,
       sourceCount: saved.source_count,
       confidenceScore: saved.confidence_score
     });
@@ -504,21 +744,51 @@ export class P1Service {
       personTitle: prospect.person_title,
       personEmail: prospect.person_email
     };
+    const sequence = await this.getProspectEmailSequence(prospect.prospect_id);
+    const templateKey = this.resolveTemplateKey(prospect.person_title, sequence, prospect.company_industry);
+    const template = templateKey ? await this.getLatestTemplateByIndustry(templateKey) : null;
+    const forceSecuritiesTemplate = (process.env.P1_FORCE_SECURITIES_TEMPLATE ?? 'true').trim().toLowerCase() === 'true';
 
-    const draft = await this.openAi.composeDraftEmail({
-      prospect: composeInput,
-      promptTemplate
-    });
+    if (forceSecuritiesTemplate && !template) {
+      throw new BadRequestException(`Khong tim thay template active cho key ${templateKey ?? 'unknown'}`);
+    }
+
+    const templateContext: TemplateComposeInput = {
+      ...composeInput,
+      step: sequence
+    };
+
+    const strictTemplateMode = (process.env.P1_TEMPLATE_STRICT_MODE ?? 'true').trim().toLowerCase() === 'true';
+
+    const draft = template
+      ? strictTemplateMode
+        ? {
+            subject: this.renderTemplateText(template.subject_template, composeInput),
+            bodyText: this.renderTemplateText(template.body_template, composeInput),
+            provider: 'fallback' as const
+          }
+        : await this.openAi.composeDraftFromTemplate({
+            promptTemplate,
+            context: templateContext,
+            templateSubject: this.renderTemplateText(template.subject_template, composeInput),
+            templateBody: this.renderTemplateText(template.body_template, composeInput)
+          })
+      : await this.openAi.composeDraftEmail({
+          prospect: composeInput,
+          promptTemplate
+        });
 
     const created = await this.pg.query<{ id: string }>(
       `INSERT INTO drafts (
-         prospect_id, company_id, channel, compose_mode, subject, body_text, status
-       ) VALUES ($1, $2, 'email', $3, $4, $5, 'pending_review')
+         prospect_id, company_id, scenario_id, template_id, channel, compose_mode, subject, body_text, status
+       ) VALUES ($1, $2, $3, $4, 'email', $5, $6, $7, 'pending_review')
        RETURNING id`,
       [
         prospect.prospect_id,
         prospect.company_id,
-        draft.provider === 'openai' ? 'from_scratch' : 'from_template',
+        templateKey,
+        template?.id ?? null,
+        template ? 'from_template' : 'from_scratch',
         draft.subject,
         draft.bodyText
       ]
@@ -534,7 +804,10 @@ export class P1Service {
 
     await this.writeAudit(actor, 'draft.created', 'draft', draftId, {
       prospectId,
-      provider: draft.provider
+      provider: draft.provider,
+      templateKey,
+      templateId: template?.id ?? null,
+      sequence
     });
 
     await this.telegram.sendDraftReviewCard({
@@ -542,7 +815,8 @@ export class P1Service {
       company: prospect.company_name,
       person: prospect.person_name,
       intendedRecipient: prospect.person_email ?? 'unknown@invalid.local',
-      subject: draft.subject
+      subject: draft.subject,
+      bodyText: draft.bodyText
     });
 
     return { draftId, status: 'pending_review' };
@@ -584,6 +858,49 @@ export class P1Service {
     };
   }
 
+  async listEmailHistory(query: {
+    status?: 'sent' | 'failed' | 'bounced' | 'delivered';
+    limit?: number;
+    offset?: number;
+  }): Promise<PagedResult<EmailHistoryRecord>> {
+    const limit = query.limit ?? 20;
+    const offset = query.offset ?? 0;
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (query.status) {
+      params.push(query.status);
+      conditions.push(`status = $${params.length}`);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countRows = await this.pg.query<{ total: number }>(
+      `SELECT COUNT(*)::int AS total FROM email_history ${where}`,
+      params
+    );
+
+    params.push(limit);
+    params.push(offset);
+
+    const items = await this.pg.query<EmailHistoryRecord>(
+      `SELECT id, draft_id, sender, intended_recipient, actual_recipient, redirected, subject, status, sent_at, created_at
+       FROM email_history
+       ${where}
+       ORDER BY created_at DESC
+       LIMIT $${params.length - 1}
+       OFFSET $${params.length}`,
+      params
+    );
+
+    return {
+      items,
+      total: countRows[0]?.total ?? 0,
+      limit,
+      offset
+    };
+  }
+
   async reviewDraft(
     draftId: string,
     dto: ReviewDraftDto,
@@ -605,6 +922,7 @@ export class P1Service {
          WHERE id = $1`,
         [draftId, !dto.subject && !dto.bodyText]
       );
+      await this.captureTemplateCandidateIfApprovedAsIs(draftId);
       await this.enqueueEmailSend(draftId);
     } else if (dto.action === 'reject') {
       newStatus = 'rejected';
@@ -624,12 +942,14 @@ export class P1Service {
          WHERE id = $1`,
         [draftId, subject, bodyText]
       );
+      const context = await this.getDraftReviewContext(draftId);
       await this.telegram.sendDraftReviewCard({
         draftId,
-        company: 'updated',
-        person: reviewer,
-        intendedRecipient: 'updated@review.local',
-        subject
+        company: context?.company ?? 'N/A',
+        person: context?.person_name ?? reviewer,
+        intendedRecipient: context?.intended_recipient ?? 'unknown@invalid.local',
+        subject,
+        bodyText
       });
     }
 
@@ -757,6 +1077,89 @@ export class P1Service {
       return;
     }
 
+    if (text.startsWith('/draft_show')) {
+      const match = text.match(/^\/draft_show\s+([a-f0-9-]{36})$/i);
+      if (!match) {
+        await this.telegram.sendText(chatId, 'Cu phap: /draft_show <draft_id>');
+        return;
+      }
+      const context = await this.getDraftReviewContext(match[1]);
+      if (!context) {
+        await this.telegram.sendText(chatId, 'Khong tim thay draft.');
+        return;
+      }
+      await this.telegram.sendText(
+        chatId,
+        [
+          `Draft: ${context.draft_id}`,
+          `Company: ${context.company ?? 'N/A'}`,
+          `Person: ${context.person_name ?? 'N/A'}`,
+          `To: ${context.intended_recipient ?? 'N/A'}`,
+          `Subject: ${context.subject}`,
+          '',
+          `Body:`,
+          context.body_text
+        ].join('\n')
+      );
+      return;
+    }
+
+    if (text.startsWith('/draft_edit')) {
+      const lines = text.split('\n');
+      const head = lines[0] ?? '';
+      const draftIdMatch = head.match(/^\/draft_edit\s+([a-f0-9-]{36})$/i);
+      if (!draftIdMatch) {
+        await this.telegram.sendText(
+          chatId,
+          'Cu phap:\n/draft_edit <draft_id>\\nSubject: <tieu de moi>\\n---\\n<body moi>'
+        );
+        return;
+      }
+      const draftId = draftIdMatch[1];
+      const context = await this.getDraftReviewContext(draftId);
+      if (!context) {
+        await this.telegram.sendText(chatId, 'Khong tim thay draft.');
+        return;
+      }
+
+      const sepIndex = lines.findIndex((line) => line.trim() === '---');
+      const secondLine = (lines[1] ?? '').trim();
+      const hasSubjectLine = /^Subject:\s*/i.test(secondLine);
+
+      const subject = hasSubjectLine
+        ? secondLine.replace(/^Subject:\s*/i, '').trim()
+        : context.subject;
+
+      let bodyText = '';
+      if (sepIndex >= 0) {
+        bodyText = lines.slice(sepIndex + 1).join('\n').trim();
+      } else if (hasSubjectLine) {
+        bodyText = lines.slice(2).join('\n').trim();
+      } else {
+        bodyText = lines.slice(1).join('\n').trim();
+      }
+
+      if (!subject || !bodyText) {
+        await this.telegram.sendText(
+          chatId,
+          'Noi dung edit khong hop le. Dung 1 trong 2 cach:\n1) /draft_edit <id>\\nSubject: ...\\n---\\n<body>\n2) /draft_edit <id>\\n<body moi>'
+        );
+        return;
+      }
+
+      await this.reviewDraft(
+        draftId,
+        {
+          action: 'edit',
+          subject,
+          bodyText
+        },
+        `tg:${fromId}`
+      );
+      await this.telegram.sendText(chatId, `Da cap nhat draft ${draftId} va gui lai card review.`);
+      return;
+    }
+
     await this.telegram.sendText(
       chatId,
       'Lenh ho tro: /prompt_show compose|serialize, /prompt_set compose|serialize <text>'
@@ -778,14 +1181,63 @@ export class P1Service {
       return;
     }
 
-    const match = data.match(/^draft:(approve|reject):([a-f0-9-]{36})$/i);
+    const match = data.match(/^draft:(approve|reject|edit|show):([a-f0-9-]{36})$/i);
     if (!match) {
       await this.telegram.answerCallbackQuery(callbackId, 'Action khong hop le');
       return;
     }
 
-    const action = match[1].toLowerCase() as 'approve' | 'reject';
+    const action = match[1].toLowerCase() as 'approve' | 'reject' | 'edit' | 'show';
     const draftId = match[2];
+
+    if (action === 'show') {
+      const message = callback.message as Record<string, unknown> | undefined;
+      const chat = message?.chat as Record<string, unknown> | undefined;
+      const chatId = chat?.id ? String(chat.id) : '';
+      if (chatId) {
+        const context = await this.getDraftReviewContext(draftId);
+        if (context) {
+          await this.telegram.sendText(
+            chatId,
+            [
+              `Draft: ${context.draft_id}`,
+              `Company: ${context.company ?? 'N/A'}`,
+              `Person: ${context.person_name ?? 'N/A'}`,
+              `To: ${context.intended_recipient ?? 'N/A'}`,
+              `Subject: ${context.subject}`,
+              '',
+              `Body:`,
+              context.body_text
+            ].join('\n')
+          );
+        }
+      }
+      await this.telegram.answerCallbackQuery(callbackId, 'Da gui full draft');
+      return;
+    }
+
+    if (action === 'edit') {
+      const message = callback.message as Record<string, unknown> | undefined;
+      const chat = message?.chat as Record<string, unknown> | undefined;
+      const chatId = chat?.id ? String(chat.id) : '';
+      if (chatId) {
+        const context = await this.getDraftReviewContext(draftId);
+        if (context) {
+          await this.telegram.sendText(
+            chatId,
+            [
+              `Mau chinh sua draft ${draftId}:`,
+              `/draft_edit ${draftId}`,
+              `Subject: ${context.subject}`,
+              `---`,
+              context.body_text
+            ].join('\n')
+          );
+        }
+      }
+      await this.telegram.answerCallbackQuery(callbackId, 'Gui mau edit');
+      return;
+    }
 
     await this.reviewDraft(
       draftId,
@@ -797,6 +1249,24 @@ export class P1Service {
     );
 
     await this.telegram.answerCallbackQuery(callbackId, `Draft ${action}d`);
+  }
+
+  private async getDraftReviewContext(draftId: string): Promise<DraftReviewContextRow | null> {
+    const rows = await this.pg.query<DraftReviewContextRow>(
+      `SELECT
+         d.id AS draft_id,
+         d.subject,
+         d.body_text,
+         p.company,
+         p.person_name,
+         p.email AS intended_recipient
+       FROM drafts d
+       LEFT JOIN prospects p ON p.id = d.prospect_id
+       WHERE d.id = $1
+       LIMIT 1`,
+      [draftId]
+    );
+    return rows[0] ?? null;
   }
 
   private async enqueueDiscovery(searchJobId: string): Promise<void> {
@@ -870,6 +1340,210 @@ export class P1Service {
       entityId: row.entity_id,
       rawJson: row.raw_json
     }));
+  }
+
+  private async loadReportKeyPersons(
+    searchJobId: string | null,
+    companyName: string
+  ): Promise<
+    Array<{
+      name: string;
+      title: string | null;
+      email: string | null;
+      phone: string | null;
+      confidence: number | null;
+      source: string;
+    }>
+  > {
+    if (!searchJobId) {
+      return [];
+    }
+
+    const rows = await this.pg.query<ReportKeyPersonRow>(
+      `SELECT person_name, position AS person_title, email AS person_email, phone AS person_phone, confidence::text AS confidence, source
+       FROM prospects
+       WHERE search_job_id = $1
+         AND lower(company) = lower($2)
+       ORDER BY
+         CASE WHEN email IS NULL OR trim(email) = '' THEN 1 ELSE 0 END ASC,
+         COALESCE(confidence, 0) DESC,
+         created_at ASC`,
+      [searchJobId, companyName]
+    );
+
+    return rows.map((row) => {
+      const confidenceValue = row.confidence !== null && row.confidence !== undefined ? Number(row.confidence) : null;
+      return {
+        name: row.person_name,
+        title: row.person_title,
+        email: row.person_email,
+        phone: row.person_phone,
+        confidence: confidenceValue !== null && Number.isFinite(confidenceValue) ? confidenceValue : null,
+        source: row.source
+      };
+    });
+  }
+
+  private async getCompanyReportDbRow(prospectId: string): Promise<ProspectCompanyReportDbRow> {
+    const rows = await this.pg.query<ProspectCompanyReportDbRow>(
+      `SELECT id, prospect_id, company_name, report_json, generated_at
+       FROM prospect_company_reports
+       WHERE prospect_id = $1
+       LIMIT 1`,
+      [prospectId]
+    );
+
+    if (!rows[0]) {
+      throw new NotFoundException(`Company report for prospect ${prospectId} not found`);
+    }
+    return rows[0];
+  }
+
+  private readReportLatex(report: ProspectCompanyReportDbRow): string {
+    const json = report.report_json as Record<string, unknown>;
+    const latex = json?.latex_source;
+    if (typeof latex === 'string' && latex.trim().length > 0) {
+      return latex;
+    }
+    return this.buildLatexReport(report.company_name, json, 'fallback', 0, null);
+  }
+
+  private buildReportFilename(companyName: string, generatedAt: string, ext: 'tex' | 'pdf'): string {
+    const safeName = companyName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'company-report';
+    const ts = new Date(generatedAt).toISOString().replace(/[:.]/g, '-');
+    return `${safeName}-${ts}.${ext}`;
+  }
+
+  private buildLatexReport(
+    companyName: string,
+    reportJson: Record<string, unknown>,
+    provider: string,
+    sourceCount: number,
+    confidenceScore: number | null
+  ): string {
+    const obj = (value: unknown): Record<string, unknown> =>
+      value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+    const str = (value: unknown): string => (typeof value === 'string' && value.trim().length > 0 ? value.trim() : 'N/A');
+    const list = (value: unknown): string[] =>
+      Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
+    const esc = (input: string): string =>
+      input
+        .replace(/\\/g, '\\textbackslash{}')
+        .replace(/([{}$&#_%])/g, '\\$1')
+        .replace(/\^/g, '\\textasciicircum{}')
+        .replace(/~/g, '\\textasciitilde{}');
+
+    const company = obj(reportJson.company_overview);
+    const keyPerson = obj(reportJson.key_person);
+    const allKeyPersonsRaw = Array.isArray(reportJson.all_key_persons) ? reportJson.all_key_persons : [];
+
+    const bullet = (items: string[]): string =>
+      items.length ? items.map((item) => `\\item ${esc(item)}`).join('\n') : '\\item N/A';
+
+    const allKeyPersonsTableRows =
+      allKeyPersonsRaw.length === 0
+        ? '\\textit{N/A} \\\\'
+        : allKeyPersonsRaw
+            .map((item) => obj(item))
+            .map(
+              (row) =>
+                `${esc(str(row.name))} & ${esc(str(row.title))} & ${esc(str(row.email))} & ${esc(str(row.phone))} & ${esc(
+                  typeof row.confidence_0_1 === 'number' ? Number(row.confidence_0_1).toFixed(2) : 'N/A'
+                )} & ${esc(str(row.source))} \\\\`
+            )
+            .join('\n');
+
+    return `\\documentclass[11pt,a4paper]{article}
+\\usepackage[utf8]{inputenc}
+\\usepackage[T5]{fontenc}
+\\usepackage[vietnamese,english]{babel}
+\\usepackage{geometry}
+\\usepackage{longtable}
+\\usepackage{array}
+\\usepackage{booktabs}
+\\geometry{margin=18mm}
+\\setlength{\\parskip}{0.4em}
+\\setlength{\\parindent}{0pt}
+\\begin{document}
+\\selectlanguage{vietnamese}
+\\section*{AI Company Report: ${esc(companyName)}}
+Provider: ${esc(provider)} \\quad Sources: ${esc(String(sourceCount))} \\quad Score: ${esc(
+      confidenceScore === null ? 'N/A' : String(confidenceScore)
+    )}
+
+\\subsection*{Executive Summary}
+${esc(str(reportJson.executive_summary))}
+
+\\subsection*{Company Overview}
+\\begin{itemize}
+\\item Domain: ${esc(str(company.domain))}
+\\item Industry: ${esc(str(company.industry))}
+\\item Region: ${esc(str(company.region))}
+\\item Summary: ${esc(str(company.summary))}
+\\end{itemize}
+
+\\subsection*{Key Person}
+\\begin{itemize}
+\\item Name: ${esc(str(keyPerson.name))}
+\\item Title: ${esc(str(keyPerson.title))}
+\\item Email: ${esc(str(keyPerson.email))}
+\\item Phone: ${esc(str(keyPerson.phone))}
+\\item LinkedIn: ${esc(str(keyPerson.linkedin))}
+\\end{itemize}
+
+\\subsection*{All Key Persons}
+\\begin{longtable}{>{\\raggedright\\arraybackslash}p{0.18\\textwidth} >{\\raggedright\\arraybackslash}p{0.24\\textwidth} >{\\raggedright\\arraybackslash}p{0.2\\textwidth} >{\\raggedright\\arraybackslash}p{0.12\\textwidth} >{\\raggedright\\arraybackslash}p{0.08\\textwidth} >{\\raggedright\\arraybackslash}p{0.12\\textwidth}}
+\\toprule
+Name & Title & Email & Phone & Conf. & Source \\\\
+\\midrule
+${allKeyPersonsTableRows}
+\\bottomrule
+\\end{longtable}
+
+\\subsection*{Buying Signals}
+\\begin{itemize}
+${bullet(list(reportJson.buying_signals))}
+\\end{itemize}
+
+\\subsection*{Risks}
+\\begin{itemize}
+${bullet(list(reportJson.risks))}
+\\end{itemize}
+
+\\subsection*{Recommended Next Steps}
+\\begin{itemize}
+${bullet(list(reportJson.recommended_next_steps))}
+\\end{itemize}
+
+\\subsection*{Data Quality Notes}
+\\begin{itemize}
+${bullet(list(reportJson.data_quality_notes))}
+\\end{itemize}
+\\end{document}
+`;
+  }
+
+  private async compileLatexToPdf(latexSource: string): Promise<Buffer> {
+    const tmpBase = await mkdtemp(join(tmpdir(), 'vnetwork-report-'));
+    const texPath = join(tmpBase, 'report.tex');
+    const pdfPath = join(tmpBase, 'report.pdf');
+
+    try {
+      await writeFile(texPath, latexSource, 'utf8');
+      try {
+        await this.execFileAsync('pdflatex', ['-interaction=nonstopmode', '-halt-on-error', 'report.tex'], {
+          cwd: tmpBase,
+          timeout: 120000,
+          maxBuffer: 8 * 1024 * 1024
+        });
+      } catch {
+        throw new BadRequestException('Server chưa có LaTeX engine (pdflatex) hoặc compile lỗi. Hãy tải file .tex để build PDF offline.');
+      }
+
+      return await readFile(pdfPath);
+    } finally {
+      await rm(tmpBase, { recursive: true, force: true });
+    }
   }
 
   private toStringArray(value: unknown): string[] {
@@ -1009,5 +1683,273 @@ export class P1Service {
       }
     }
     return fallback;
+  }
+
+  async listTemplates(query: ListTemplatesQueryDto): Promise<PagedResult<EmailTemplateRecord>> {
+    const limit = query.limit ?? 20;
+    const offset = query.offset ?? 0;
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (query.status) {
+      params.push(query.status);
+      conditions.push(`status = $${params.length}`);
+    }
+    if (query.q?.trim()) {
+      params.push(`%${query.q.trim()}%`);
+      conditions.push(`industry ILIKE $${params.length}`);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const count = await this.pg.query<{ total: number }>(`SELECT COUNT(*)::int AS total FROM email_templates ${where}`, params);
+    params.push(limit, offset);
+    const items = await this.pg.query<EmailTemplateRecord>(
+      `SELECT id, industry, subject_template, body_template, version
+       FROM email_templates
+       ${where}
+       ORDER BY updated_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    return { items, total: count[0]?.total ?? 0, limit, offset };
+  }
+
+  async createTemplate(dto: CreateTemplateDto, actor: string): Promise<EmailTemplateRecord> {
+    const latest = await this.pg.query<{ version: number }>(
+      `SELECT COALESCE(MAX(version), 0)::int AS version FROM email_templates WHERE industry = $1`,
+      [dto.industry.trim()]
+    );
+    const version = (latest[0]?.version ?? 0) + 1;
+    const rows = await this.pg.query<EmailTemplateRecord>(
+      `INSERT INTO email_templates (industry, subject_template, body_template, status, version)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, industry, subject_template, body_template, version`,
+      [dto.industry.trim(), dto.subjectTemplate.trim(), dto.bodyTemplate.trim(), dto.status ?? 'active', version]
+    );
+    await this.writeAudit(actor, 'template.created', 'email_template', rows[0].id, { industry: rows[0].industry, version });
+    return rows[0];
+  }
+
+  async updateTemplate(id: string, dto: UpdateTemplateDto, actor: string): Promise<EmailTemplateRecord> {
+    const rows = await this.pg.query<EmailTemplateRecord>(
+      `UPDATE email_templates
+       SET industry = COALESCE($2, industry),
+           subject_template = COALESCE($3, subject_template),
+           body_template = COALESCE($4, body_template),
+           status = COALESCE($5, status),
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, industry, subject_template, body_template, version`,
+      [id, dto.industry?.trim() ?? null, dto.subjectTemplate?.trim() ?? null, dto.bodyTemplate?.trim() ?? null, dto.status ?? null]
+    );
+    if (!rows[0]) throw new NotFoundException(`Template ${id} not found`);
+    await this.writeAudit(actor, 'template.updated', 'email_template', id, {});
+    return rows[0];
+  }
+
+  async listTemplateCandidates(query: ListTemplateCandidatesQueryDto): Promise<PagedResult<TemplateCandidateRecord>> {
+    const limit = query.limit ?? 20;
+    const offset = query.offset ?? 0;
+    const params: unknown[] = [];
+    const conditions: string[] = [];
+    if (query.templateKey?.trim()) {
+      params.push(query.templateKey.trim());
+      conditions.push(`template_key = $${params.length}`);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const count = await this.pg.query<{ total: number }>(
+      `SELECT COUNT(*)::int AS total FROM template_candidates ${where}`,
+      params
+    );
+    params.push(limit, offset);
+    const items = await this.pg.query<TemplateCandidateRecord>(
+      `SELECT id, draft_id, template_key, subject, body_text, normalized_body, similarity_score::text, promoted, created_at
+       FROM template_candidates ${where}
+       ORDER BY created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    return { items, total: count[0]?.total ?? 0, limit, offset };
+  }
+
+  async runTemplateLearningPromote(actor: string): Promise<{ promoted: number }> {
+    const keys = await this.pg.query<{ template_key: string }>(
+      `SELECT template_key
+       FROM template_candidates
+       WHERE promoted = false
+         AND created_at >= now() - interval '30 days'
+       GROUP BY template_key
+       HAVING COUNT(*) >= 3`
+    );
+
+    let promoted = 0;
+    for (const row of keys) {
+      const candidates = await this.pg.query<TemplateCandidateRecord>(
+        `SELECT id, draft_id, template_key, subject, body_text, normalized_body, similarity_score::text, promoted, created_at
+         FROM template_candidates
+         WHERE promoted = false
+           AND template_key = $1
+           AND created_at >= now() - interval '30 days'
+         ORDER BY created_at DESC
+         LIMIT 10`,
+        [row.template_key]
+      );
+      if (candidates.length < 3) continue;
+      const base = candidates[0];
+      const sims = candidates.slice(1, 3).map((item) => this.computeTextSimilarity(base.normalized_body, item.normalized_body));
+      const minSim = Math.min(...sims);
+      if (minSim < 0.85) continue;
+
+      const latest = await this.pg.query<{ version: number }>(
+        `SELECT COALESCE(MAX(version), 0)::int AS version FROM email_templates WHERE industry = $1`,
+        [row.template_key]
+      );
+      const version = (latest[0]?.version ?? 0) + 1;
+      const created = await this.pg.query<{ id: string }>(
+        `INSERT INTO email_templates (industry, subject_template, body_template, status, version)
+         VALUES ($1, $2, $3, 'draft', $4)
+         RETURNING id`,
+        [row.template_key, base.subject, base.body_text, version]
+      );
+      const templateId = created[0].id;
+      await this.pg.query(
+        `UPDATE template_candidates
+         SET promoted = true, promoted_template_id = $2, promoted_at = now(), similarity_score = $3
+         WHERE template_key = $1
+           AND promoted = false
+           AND created_at >= now() - interval '30 days'`,
+        [row.template_key, templateId, minSim]
+      );
+      promoted += 1;
+      await this.writeAudit(actor, 'template_learning.promoted', 'email_template', templateId, {
+        templateKey: row.template_key,
+        minSimilarity: minSim
+      });
+    }
+
+    return { promoted };
+  }
+
+  private async captureTemplateCandidateIfApprovedAsIs(draftId: string): Promise<void> {
+    const rows = await this.pg.query<{
+      draft_id: string;
+      scenario_id: string | null;
+      subject: string;
+      body_text: string;
+      approved_as_is: boolean;
+    }>(
+      `SELECT id AS draft_id, scenario_id, subject, body_text, approved_as_is
+       FROM drafts
+       WHERE id = $1`,
+      [draftId]
+    );
+    const draft = rows[0];
+    if (!draft || !draft.approved_as_is) return;
+    const templateKey = (draft.scenario_id ?? '').trim();
+    if (!templateKey) return;
+    const normalized = this.normalizeBodyForSimilarity(draft.body_text);
+    await this.pg.query(
+      `INSERT INTO template_candidates (draft_id, template_key, industry, role_level, subject, body_text, normalized_body)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (draft_id) DO NOTHING`,
+      [draft.draft_id, templateKey, templateKey, null, draft.subject, draft.body_text, normalized]
+    );
+  }
+
+  private normalizeBodyForSimilarity(input: string): string {
+    return input
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private computeTextSimilarity(a: string, b: string): number {
+    const setA = new Set(a.split(' ').filter(Boolean));
+    const setB = new Set(b.split(' ').filter(Boolean));
+    if (!setA.size || !setB.size) return 0;
+    let inter = 0;
+    for (const token of setA) {
+      if (setB.has(token)) inter += 1;
+    }
+    const union = new Set([...setA, ...setB]).size;
+    return union > 0 ? inter / union : 0;
+  }
+
+  private async getProspectEmailSequence(prospectId: string): Promise<number> {
+    const rows = await this.pg.query<{ total_sent: number }>(
+      `SELECT COUNT(*)::int AS total_sent
+       FROM email_history eh
+       INNER JOIN drafts d ON d.id = eh.draft_id
+       WHERE d.prospect_id = $1
+         AND eh.status IN ('sent', 'delivered')`,
+      [prospectId]
+    );
+
+    const sentCount = rows[0]?.total_sent ?? 0;
+    const nextStep = sentCount + 1;
+    return Math.min(Math.max(nextStep, 1), 3);
+  }
+
+  private resolveTemplateKey(personTitle: string | null, step: number, companyIndustry: string | null): string | null {
+    const forceSecuritiesTemplate = (process.env.P1_FORCE_SECURITIES_TEMPLATE ?? 'true').trim().toLowerCase() === 'true';
+    if (!forceSecuritiesTemplate && !this.isSecuritiesIndustry(companyIndustry)) {
+      return null;
+    }
+
+    const role = (personTitle ?? '').toLowerCase();
+    const isTech =
+      role.includes('cto') ||
+      role.includes('it') ||
+      role.includes('security') ||
+      role.includes('hạ tầng') ||
+      role.includes('ha tang');
+    const track = isTech ? 'securities_cto' : 'securities_ceo';
+    return `${track}_followup_${step}`;
+  }
+
+  private isSecuritiesIndustry(industry: string | null): boolean {
+    const text = (industry ?? '').trim().toLowerCase();
+    if (!text) return false;
+    return (
+      text.includes('chứng khoán') ||
+      text.includes('chung khoan') ||
+      text.includes('securities') ||
+      text.includes('brokerage') ||
+      text.includes('finance') ||
+      text.includes('financial')
+    );
+  }
+
+  private async getLatestTemplateByIndustry(industry: string): Promise<EmailTemplateRecord | null> {
+    const rows = await this.pg.query<EmailTemplateRecord>(
+      `SELECT id, industry, subject_template, body_template, version
+       FROM email_templates
+       WHERE industry = $1 AND status = 'active'
+       ORDER BY version DESC
+       LIMIT 1`,
+      [industry]
+    );
+    return rows[0] ?? null;
+  }
+
+  private renderTemplateText(template: string, prospect: ProspectComposeInput): string {
+    const senderName = 'Ngoc Y';
+    const senderCompany = 'VNETWORK';
+    const recipientName = prospect.personName || 'Anh/Chị';
+    const map: Record<string, string> = {
+      '{{company_name}}': prospect.companyName || '[Company]',
+      '{{recipient_name}}': recipientName,
+      '{{person_name}}': recipientName,
+      '{{person_title}}': prospect.personTitle || 'Anh/Chị',
+      '{{person_email}}': prospect.personEmail || '',
+      '{{sender_name}}': senderName,
+      '{{sender_company}}': senderCompany
+    };
+
+    let output = template;
+    for (const [key, value] of Object.entries(map)) {
+      output = output.split(key).join(value);
+    }
+    return output;
   }
 }

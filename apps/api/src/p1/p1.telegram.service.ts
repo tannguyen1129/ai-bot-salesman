@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosError, AxiosInstance } from 'axios';
 
 interface TelegramUser {
   id: number;
@@ -28,6 +28,23 @@ export class P1TelegramService {
     });
   }
 
+  private formatAxiosError(error: unknown): string {
+    if (axios.isAxiosError(error)) {
+      const typed = error as AxiosError<{ description?: string }>;
+      const status = typed.response?.status ?? 'n/a';
+      const code = typed.code ?? 'n/a';
+      const description =
+        typed.response?.data && typeof typed.response.data === 'object'
+          ? typed.response.data.description ?? JSON.stringify(typed.response.data)
+          : typed.message || 'unknown';
+      return `status=${status} code=${code} detail=${description}`;
+    }
+    if (error instanceof Error) {
+      return error.message || error.name;
+    }
+    return 'unknown error';
+  }
+
   isConfigured(): boolean {
     return Boolean(this.token && this.reviewChatId);
   }
@@ -50,7 +67,7 @@ export class P1TelegramService {
         disable_web_page_preview: true
       });
     } catch (error) {
-      this.logger.warn(`telegram send text failed: ${error instanceof Error ? error.message : 'unknown error'}`);
+      this.logger.warn(`telegram send text failed: ${this.formatAxiosError(error)}`);
     }
   }
 
@@ -60,10 +77,15 @@ export class P1TelegramService {
     person: string;
     intendedRecipient: string;
     subject: string;
+    bodyText?: string | null;
   }): Promise<void> {
     if (!this.isConfigured()) {
       return;
     }
+
+    const bodyPreview = (input.bodyText ?? '').trim();
+    const trimmedBody =
+      bodyPreview.length > 900 ? `${bodyPreview.slice(0, 900)}\n...[truncated for Telegram card]` : bodyPreview;
 
     const text = [
       `P1 Draft Review`,
@@ -71,26 +93,42 @@ export class P1TelegramService {
       `Company: ${input.company}`,
       `Person: ${input.person}`,
       `To (intended): ${input.intendedRecipient}`,
-      `Subject: ${input.subject}`
+      `Subject: ${input.subject}`,
+      '',
+      `Body preview:`,
+      trimmedBody || '(empty)'
     ].join('\n');
 
-    try {
-      await this.api.post('/sendMessage', {
-        chat_id: this.reviewChatId,
-        text,
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: 'Approve', callback_data: `draft:approve:${input.draftId}` },
-              { text: 'Reject', callback_data: `draft:reject:${input.draftId}` }
-            ]
-          ]
+    const payload = {
+      chat_id: this.reviewChatId,
+      text,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: 'Approve', callback_data: `draft:approve:${input.draftId}` },
+            { text: 'Reject', callback_data: `draft:reject:${input.draftId}` },
+            { text: 'Edit', callback_data: `draft:edit:${input.draftId}` }
+          ],
+          [{ text: 'Show Full Draft', callback_data: `draft:show:${input.draftId}` }]
+        ]
+      }
+    };
+
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.api.post('/sendMessage', payload);
+        return;
+      } catch (error) {
+        const details = this.formatAxiosError(error);
+        this.logger.warn(
+          `telegram send draft review failed (attempt ${attempt}/${maxAttempts}) draft=${input.draftId}: ${details}`
+        );
+        if (attempt >= maxAttempts) {
+          return;
         }
-      });
-    } catch (error) {
-      this.logger.warn(
-        `telegram send draft review failed: ${error instanceof Error ? error.message : 'unknown error'}`
-      );
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+      }
     }
   }
 
@@ -106,9 +144,7 @@ export class P1TelegramService {
         show_alert: false
       });
     } catch (error) {
-      this.logger.warn(
-        `telegram answer callback failed: ${error instanceof Error ? error.message : 'unknown error'}`
-      );
+      this.logger.warn(`telegram answer callback failed: ${this.formatAxiosError(error)}`);
     }
   }
 

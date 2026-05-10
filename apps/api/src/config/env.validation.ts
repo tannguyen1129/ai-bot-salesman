@@ -55,6 +55,31 @@ class EnvSchema {
 
   @IsOptional()
   @IsString()
+  AI_PROVIDER?: string;
+
+  @IsOptional()
+  @IsString()
+  GEMINI_API_KEY?: string;
+
+  @IsOptional()
+  @IsString()
+  GEMINI_MODEL_FAST?: string;
+
+  @IsOptional()
+  @IsString()
+  GEMINI_MODEL_BALANCED?: string;
+
+  @IsOptional()
+  @IsString()
+  GEMINI_MODEL_REASONING?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  GEMINI_REQUEST_TIMEOUT_MS?: number;
+
+  @IsOptional()
+  @IsString()
   RAPIDAPI_KEY?: string;
 
   @IsOptional()
@@ -166,6 +191,27 @@ class EnvSchema {
   @IsOptional()
   @IsString()
   P1_EMAIL_SENDER?: string;
+
+  @IsOptional()
+  @IsString()
+  P1_SMTP_HOST?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  P1_SMTP_PORT?: number;
+
+  @IsOptional()
+  @IsString()
+  P1_SMTP_SECURE?: string;
+
+  @IsOptional()
+  @IsString()
+  P1_SMTP_USER?: string;
+
+  @IsOptional()
+  @IsString()
+  P1_SMTP_PASS?: string;
 
   @IsOptional()
   @IsString()

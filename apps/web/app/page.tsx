@@ -3,57 +3,46 @@ export default function HomePage() {
     <main className="page">
       <div className="container">
         <section className="landingHero">
-          <p className="eyebrow">Demo Day Ready - 08/05/2026</p>
-          <h1>AI Sales Agent P1 - Website Demo Console</h1>
+          <p className="eyebrow">Internal Product · P1 Ready</p>
+          <h1>AI Sales Agent</h1>
           <p>
-            Full flow demo tren web: search company that, sinh prospect, tao draft AI, review approve/reject, va gui
-            mail theo Safe Mode redirect.
+            Một frontend thống nhất cho team Sales vận hành full luồng: tìm công ty, chọn prospect phù hợp, tạo report AI,
+            và chuyển tiếp sang các module duyệt draft/email theo Safe Mode.
           </p>
           <div className="landingActions">
             <a className="ctaBtn" href="/workspace">
-              Mo Demo Workspace
+              Mở Workspace Chính
             </a>
-            <a className="ghostBtn" href="/guide">
-              Xem Playbook P1
+            <a className="ghostBtn" href="/report-workflow">
+              Mở Report Studio
+            </a>
+            <a className="ghostBtn" href="/console">
+              Mở Operations Console
             </a>
           </div>
         </section>
 
-        <section className="cards landingCards">
+        <section className="cards">
           <article className="card">
-            <h2>SC-03 New Search</h2>
-            <p className="cardText">Nhap ten cong ty, region, industry de tao search job trong vai Sales.</p>
-            <a href="/workspace#jobs-section">Đi tới khu vực tạo job</a>
+            <h2>Core Workflow</h2>
+            <strong>Search → Prospect → Report</strong>
+            <p className="cardText">Luồng chính hoàn chỉnh trong một trải nghiệm liền mạch, dùng API thật từ backend P1.</p>
           </article>
           <article className="card">
-            <h2>SC-04 Job Tracking</h2>
-            <p className="cardText">Theo doi queued/running/completed/failed va retry nhanh neu job loi.</p>
-            <a href="/workspace#jobs-section">Xem bảng search jobs</a>
+            <h2>Operations</h2>
+            <strong>Realtime Control</strong>
+            <p className="cardText">Theo dõi search jobs, prospect pipeline, draft queue và trạng thái thực thi theo thời gian thực.</p>
           </article>
           <article className="card">
-            <h2>SC-07 Draft Inbox</h2>
-            <p className="cardText">Tao draft tu prospect, review tren web/telegram roi approve de send safe mode.</p>
-            <a href="/workspace#prospects-section">Mở danh sách prospects</a>
+            <h2>Product Safety</h2>
+            <strong>Safe Mode Default</strong>
+            <p className="cardText">Giữ đúng guardrail P1: review thủ công, redirect outbound và lưu vết audit đầy đủ.</p>
           </article>
           <article className="card">
-            <h2>Safe Mode Guardrail</h2>
-            <p className="cardText">Mail duoc redirect ve inbox test, luu intended/actual recipient de audit.</p>
-            <a href="/guide">Đọc checklist triển khai</a>
+            <h2>Team Onboarding</h2>
+            <strong>Playbook + Check</strong>
+            <p className="cardText">Có playbook vận hành và trang kiểm tra kết nối để setup nhanh, giảm lỗi khi chạy demo/live.</p>
           </article>
-        </section>
-
-        <section className="quickPanel">
-          <h3>Checklist nhanh trước khi chạy</h3>
-          <ul>
-            <li>API + Worker đã chạy: `npm run dev:api` và `npm run dev:worker`.</li>
-            <li>PostgreSQL + Redis đã khởi động.</li>
-            <li>Cau hinh RAPIDAPI/HUNTER/APOLLO/OPENAI key that.</li>
-            <li>Cau hinh TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_REVIEW_CHAT_ID.</li>
-            <li>Kiểm tra kết nối API trước khi vận hành trên môi trường mới.</li>
-          </ul>
-          <a className="ghostBtn" href="/system-check">
-            Mở trang kiểm tra kết nối
-          </a>
         </section>
       </div>
     </main>
