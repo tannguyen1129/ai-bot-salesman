@@ -228,6 +228,50 @@ class EnvSchema {
   @IsOptional()
   @IsString()
   TELEGRAM_REVIEW_WHITELIST_IDS?: string;
+
+  @IsOptional()
+  @IsString()
+  P1_BOUNCE_LISTENER_ENABLED?: string;
+
+  @IsOptional()
+  @IsString()
+  P1_IMAP_HOST?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  P1_IMAP_PORT?: number;
+
+  @IsOptional()
+  @IsString()
+  P1_IMAP_SECURE?: string;
+
+  @IsOptional()
+  @IsString()
+  P1_IMAP_USER?: string;
+
+  @IsOptional()
+  @IsString()
+  P1_IMAP_PASS?: string;
+
+  @IsOptional()
+  @IsString()
+  P1_IMAP_MAILBOX?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1000)
+  P1_BOUNCE_POLL_INTERVAL_MS?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  P1_BOUNCE_SOFT_MAX?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  P1_BOUNCE_SUPPRESS_DAYS?: number;
 }
 
 export function validateEnv(config: Record<string, unknown>): Record<string, unknown> {

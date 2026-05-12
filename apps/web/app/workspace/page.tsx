@@ -1,6 +1,6 @@
 'use client';
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 type PagedResult<T> = { items: T[]; total: number; limit: number; offset: number };
 
@@ -35,19 +35,6 @@ type Draft = {
   created_at: string;
   approved_at: string | null;
   sent_at: string | null;
-};
-
-type EmailHistory = {
-  id: string;
-  draft_id: string;
-  sender: string;
-  intended_recipient: string;
-  actual_recipient: string;
-  redirected: boolean;
-  subject: string;
-  status: 'sent' | 'failed' | 'bounced' | 'delivered';
-  sent_at: string | null;
-  created_at: string;
 };
 
 type ProspectCompanyReport = {
@@ -91,6 +78,18 @@ function formatDate(value: string | null): string {
   return new Date(value).toLocaleString('vi-VN');
 }
 
+function formatRelative(value: string | null): string {
+  if (!value) return '';
+  const diff = Date.now() - new Date(value).getTime();
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return 'vừa xong';
+  if (m < 60) return `${m} phút trước`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} giờ trước`;
+  const d = Math.floor(h / 24);
+  return `${d} ngày trước`;
+}
+
 function readObj(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
@@ -106,29 +105,34 @@ function readStrArray(value: unknown): string[] {
 }
 
 export default function WorkspacePage() {
-  const [apiBase, setApiBase] = useState(resolveApiBase);
+  const apiBaseRef = useRef(resolveApiBase());
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
 
   const [searchForm, setSearchForm] = useState({ companyName: '', region: '', industry: '' });
-  const [jobs, setJobs] = useState<PagedResult<SearchJob>>({ items: [], total: 0, limit: 10, offset: 0 });
-  const [prospects, setProspects] = useState<PagedResult<Prospect>>({ items: [], total: 0, limit: 20, offset: 0 });
+  const [jobs, setJobs] = useState<PagedResult<SearchJob>>({ items: [], total: 0, limit: 50, offset: 0 });
+  const [prospects, setProspects] = useState<PagedResult<Prospect>>({ items: [], total: 0, limit: 50, offset: 0 });
   const [rawSnapshots, setRawSnapshots] = useState<PagedResult<RawSnapshot>>({ items: [], total: 0, limit: 20, offset: 0 });
-  const [drafts, setDrafts] = useState<PagedResult<Draft>>({ items: [], total: 0, limit: 20, offset: 0 });
-  const [emailHistory, setEmailHistory] = useState<PagedResult<EmailHistory>>({ items: [], total: 0, limit: 20, offset: 0 });
+  const [draftsTotal, setDraftsTotal] = useState({ total: 0, pending: 0 });
 
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [selectedProspectId, setSelectedProspectId] = useState<string | null>(null);
-  const [selectedRawSnapshotId, setSelectedRawSnapshotId] = useState<string | null>(null);
   const [reportModelKind, setReportModelKind] = useState<ReportModelKind>('balanced');
-
   const [report, setReport] = useState<ProspectCompanyReport | null>(null);
-  const [rawFilters, setRawFilters] = useState({ source: '', entityType: '', q: '' });
+
+  const [jobFilter, setJobFilter] = useState('');
+  const [showCreateDrawer, setShowCreateDrawer] = useState(false);
+  const [showRawData, setShowRawData] = useState(false);
+  const [selectedRawSnapshotId, setSelectedRawSnapshotId] = useState<string | null>(null);
+  const [reportGenerating, setReportGenerating] = useState(false);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [draftGenerating, setDraftGenerating] = useState(false);
+  const reportCardRef = useRef<HTMLDivElement | null>(null);
 
   const fetchJson = useCallback(
     async <T,>(path: string, init?: RequestInit): Promise<T> => {
-      const response = await fetch(`${apiBase}${path}`, {
+      const response = await fetch(`${apiBaseRef.current}${path}`, {
         ...init,
         headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) }
       });
@@ -138,81 +142,128 @@ export default function WorkspacePage() {
       }
       return response.json() as Promise<T>;
     },
-    [apiBase]
+    []
   );
 
+  const selectedJob = useMemo(() => jobs.items.find((item) => item.id === selectedJobId) ?? null, [jobs.items, selectedJobId]);
   const selectedProspect = useMemo(() => prospects.items.find((item) => item.id === selectedProspectId) ?? null, [prospects.items, selectedProspectId]);
   const selectedRawSnapshot = useMemo(() => rawSnapshots.items.find((item) => item.id === selectedRawSnapshotId) ?? null, [rawSnapshots.items, selectedRawSnapshotId]);
 
+  const filteredJobs = useMemo(() => {
+    const q = jobFilter.trim().toLowerCase();
+    if (!q) return jobs.items;
+    return jobs.items.filter((job) =>
+      job.keyword.toLowerCase().includes(q) ||
+      (job.industry ?? '').toLowerCase().includes(q) ||
+      (job.region ?? '').toLowerCase().includes(q)
+    );
+  }, [jobs.items, jobFilter]);
+
   const loadJobs = useCallback(async () => {
-    const result = await fetchJson<PagedResult<SearchJob>>('/p1/search-jobs?limit=10&offset=0');
+    const result = await fetchJson<PagedResult<SearchJob>>('/p1/search-jobs?limit=50&offset=0');
     setJobs(result);
-    if (!selectedJobId && result.items.length) setSelectedJobId(result.items[0].id);
-  }, [fetchJson, selectedJobId]);
-
-  const loadProspects = useCallback(async () => {
-    if (!selectedJobId) {
-      setProspects({ items: [], total: 0, limit: 20, offset: 0 });
-      return;
-    }
-    const result = await fetchJson<PagedResult<Prospect>>(`/p1/prospects?searchJobId=${encodeURIComponent(selectedJobId)}&limit=20&offset=0`);
-    setProspects(result);
-    if (!selectedProspectId && result.items.length) setSelectedProspectId(result.items[0].id);
-  }, [fetchJson, selectedJobId, selectedProspectId]);
-
-  const loadRawSnapshots = useCallback(async () => {
-    if (!selectedJobId) {
-      setRawSnapshots({ items: [], total: 0, limit: 20, offset: 0 });
-      setSelectedRawSnapshotId(null);
-      return;
-    }
-
-    const params = new URLSearchParams();
-    params.set('limit', '20');
-    params.set('offset', '0');
-    if (rawFilters.source.trim()) params.set('source', rawFilters.source.trim());
-    if (rawFilters.entityType.trim()) params.set('entityType', rawFilters.entityType.trim());
-    if (rawFilters.q.trim()) params.set('q', rawFilters.q.trim());
-
-    const result = await fetchJson<PagedResult<RawSnapshot>>(`/p1/search-jobs/${encodeURIComponent(selectedJobId)}/raw-snapshots?${params.toString()}`);
-    setRawSnapshots(result);
-    if (!selectedRawSnapshotId && result.items.length) setSelectedRawSnapshotId(result.items[0].id);
-  }, [fetchJson, rawFilters.entityType, rawFilters.q, rawFilters.source, selectedJobId, selectedRawSnapshotId]);
-
-  const loadDrafts = useCallback(async () => {
-    const result = await fetchJson<PagedResult<Draft>>('/p1/drafts?limit=20&offset=0');
-    setDrafts(result);
+    return result;
   }, [fetchJson]);
 
-  const loadEmailHistory = useCallback(async () => {
-    const result = await fetchJson<PagedResult<EmailHistory>>('/p1/email-history?limit=20&offset=0');
-    setEmailHistory(result);
+  const loadProspects = useCallback(
+    async (jobId: string) => {
+      const result = await fetchJson<PagedResult<Prospect>>(`/p1/prospects?searchJobId=${encodeURIComponent(jobId)}&limit=50&offset=0`);
+      setProspects(result);
+      return result;
+    },
+    [fetchJson]
+  );
+
+  const loadRawSnapshots = useCallback(
+    async (jobId: string) => {
+      const result = await fetchJson<PagedResult<RawSnapshot>>(`/p1/search-jobs/${encodeURIComponent(jobId)}/raw-snapshots?limit=20&offset=0`);
+      setRawSnapshots(result);
+      return result;
+    },
+    [fetchJson]
+  );
+
+  const loadDraftsSummary = useCallback(async () => {
+    const result = await fetchJson<PagedResult<Draft>>('/p1/drafts?limit=50&offset=0');
+    const pending = result.items.filter((d) => d.status === 'pending_review').length;
+    setDraftsTotal({ total: result.total, pending });
   }, [fetchJson]);
 
-  const refreshAll = useCallback(async () => {
+  useEffect(() => {
     setLoading(true);
     setErrorText(null);
-    try {
-      await loadJobs();
-      await loadProspects();
-      await loadRawSnapshots();
-      await loadDrafts();
-      await loadEmailHistory();
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : 'Không thể tải dữ liệu');
-    } finally {
-      setLoading(false);
+    Promise.all([loadJobs(), loadDraftsSummary()])
+      .then(([jobsResult]) => {
+        if (jobsResult.items.length && !selectedJobId) {
+          setSelectedJobId(jobsResult.items[0].id);
+        }
+      })
+      .catch((error) => setErrorText(error instanceof Error ? error.message : 'Không thể tải dữ liệu'))
+      .finally(() => setLoading(false));
+  }, [loadJobs, loadDraftsSummary, selectedJobId]);
+
+  useEffect(() => {
+    if (!selectedJobId) {
+      setProspects({ items: [], total: 0, limit: 50, offset: 0 });
+      setRawSnapshots({ items: [], total: 0, limit: 20, offset: 0 });
+      setSelectedProspectId(null);
+      setReport(null);
+      return;
     }
-  }, [loadDrafts, loadEmailHistory, loadJobs, loadProspects, loadRawSnapshots]);
+
+    setLoading(true);
+    setErrorText(null);
+    loadProspects(selectedJobId)
+      .then((result) => {
+        if (result.items.length) setSelectedProspectId((prev) => prev ?? result.items[0].id);
+        else setSelectedProspectId(null);
+      })
+      .catch((error) => setErrorText(error instanceof Error ? error.message : 'Không tải được prospect'))
+      .finally(() => setLoading(false));
+  }, [selectedJobId, loadProspects]);
 
   useEffect(() => {
-    void refreshAll();
-  }, [refreshAll]);
+    if (!selectedProspectId) {
+      setReport(null);
+      return;
+    }
+
+    let cancelled = false;
+    setReport(null);
+    setReportLoading(true);
+
+    fetch(`${apiBaseRef.current}/p1/prospects/${selectedProspectId}/report`)
+      .then(async (response) => {
+        if (cancelled) return;
+        if (response.status === 404) {
+          setReport(null);
+          return;
+        }
+        if (!response.ok) {
+          throw new Error((await response.text()) || `HTTP ${response.status}`);
+        }
+        const data = (await response.json()) as ProspectCompanyReport;
+        if (!cancelled) setReport(data);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setErrorText(error instanceof Error ? error.message : 'Không tải được báo cáo đã lưu');
+      })
+      .finally(() => {
+        if (!cancelled) setReportLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProspectId]);
 
   useEffect(() => {
-    void loadProspects();
-    void loadRawSnapshots();
-  }, [loadProspects, loadRawSnapshots]);
+    if (!showRawData || !selectedJobId) return;
+    void loadRawSnapshots(selectedJobId).catch((error) =>
+      setErrorText(error instanceof Error ? error.message : 'Không tải được raw data')
+    );
+  }, [showRawData, selectedJobId, loadRawSnapshots]);
 
   async function handleCreateSearch(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
@@ -232,9 +283,11 @@ export default function WorkspacePage() {
       });
 
       setSearchForm({ companyName: '', region: '', industry: '' });
-      setSelectedJobId(created.jobId);
-      await refreshAll();
-      setNotice(`Đã tạo job ${created.jobId.slice(0, 8)}...`);
+      setShowCreateDrawer(false);
+      const refreshed = await loadJobs();
+      const fresh = refreshed.items.find((item) => item.id === created.jobId);
+      if (fresh) setSelectedJobId(fresh.id);
+      setNotice(`Đã tạo đợt "${fresh?.keyword ?? created.jobId.slice(0, 8)}". Đang chạy nguồn dữ liệu…`);
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : 'Không tạo được search job');
     }
@@ -242,9 +295,14 @@ export default function WorkspacePage() {
 
   async function handleGenerateAndSaveReport(): Promise<void> {
     if (!selectedProspectId) return;
-    setLoading(true);
+    setReportGenerating(true);
+    setReport(null);
     setErrorText(null);
     setNotice(null);
+
+    requestAnimationFrame(() => {
+      reportCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
 
     try {
       const saved = await fetchJson<ProspectCompanyReport>(`/p1/prospects/${selectedProspectId}/report`, {
@@ -252,35 +310,35 @@ export default function WorkspacePage() {
         body: JSON.stringify({ modelKind: reportModelKind })
       });
       setReport(saved);
-      setNotice(`Đã xuất report (${saved.provider}, mode=${reportModelKind}) lúc ${formatDate(saved.generated_at)}.`);
+      setNotice(`Đã xuất report (${saved.provider}, mode=${reportModelKind}).`);
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : 'Không tạo được report');
     } finally {
-      setLoading(false);
+      setReportGenerating(false);
     }
   }
 
   async function handleGenerateDraft(): Promise<void> {
     if (!selectedProspectId) return;
-    setLoading(true);
+    setDraftGenerating(true);
     setErrorText(null);
     setNotice(null);
 
     try {
       const result = await fetchJson<{ draftId: string }>(`/p1/prospects/${selectedProspectId}/generate-draft`, { method: 'POST' });
-      await loadDrafts();
+      await loadDraftsSummary();
       setNotice(`Đã tạo draft ${result.draftId.slice(0, 8)} và gửi card review qua Telegram.`);
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : 'Không tạo được draft');
     } finally {
-      setLoading(false);
+      setDraftGenerating(false);
     }
   }
 
   async function handleDownloadLatex(): Promise<void> {
     if (!selectedProspectId) return;
     try {
-      const response = await fetch(`${apiBase}/p1/prospects/${selectedProspectId}/report/latex`);
+      const response = await fetch(`${apiBaseRef.current}/p1/prospects/${selectedProspectId}/report/latex`);
       if (!response.ok) {
         const text = await response.text();
         throw new Error(text || `HTTP ${response.status}`);
@@ -303,7 +361,7 @@ export default function WorkspacePage() {
   async function handleDownloadPdf(): Promise<void> {
     if (!selectedProspectId) return;
     try {
-      const response = await fetch(`${apiBase}/p1/prospects/${selectedProspectId}/report/pdf`);
+      const response = await fetch(`${apiBaseRef.current}/p1/prospects/${selectedProspectId}/report/pdf`);
       if (!response.ok) {
         const text = await response.text();
         throw new Error(text || `HTTP ${response.status}`);
@@ -370,250 +428,527 @@ export default function WorkspacePage() {
     popup.print();
   }
 
+  const stage: 'no-job' | 'no-prospect' | 'ready' | 'has-report' = !selectedJobId
+    ? 'no-job'
+    : !selectedProspectId
+    ? 'no-prospect'
+    : report
+    ? 'has-report'
+    : 'ready';
+
   return (
-    <main className="page">
-      <div className="container">
-        <section className="hero">
-          <div>
-            <p className="eyebrow">VNETWORK Sales Platform</p>
-            <h1>Full Flow: Discovery → Report → Telegram Review → Send</h1>
-            <p>Bản draft được duyệt và chỉnh sửa qua Telegram Bot theo nghiệp vụ CEO/Sales. Web chỉ theo dõi trạng thái.</p>
+    <main className="page wsPage">
+      <div className="wsShell">
+        {/* TOPBAR */}
+        <header className="wsTopbar">
+          <div className="wsCrumb">
+            <span className="wsCrumbHead">Workspace</span>
+            <span className="wsCrumbSep">/</span>
+            <span className={`wsCrumbItem ${selectedJob ? 'active' : ''}`}>
+              {selectedJob ? selectedJob.keyword : 'Chưa chọn đợt'}
+            </span>
+            <span className="wsCrumbSep">/</span>
+            <span className={`wsCrumbItem ${selectedProspect ? 'active' : ''}`}>
+              {selectedProspect ? selectedProspect.person_name : 'Chưa chọn prospect'}
+            </span>
+            <span className="wsCrumbSep">/</span>
+            <span className={`wsCrumbItem ${report ? 'active' : ''}`}>
+              {report ? `Report · ${report.provider}` : 'Chưa có report'}
+            </span>
           </div>
-          <label className="apiBox">
-            <span>API Base URL</span>
-            <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
-          </label>
-        </section>
 
-        {errorText ? <div className="alert">{errorText}</div> : null}
-        {notice ? <div className="successAlert">{notice}</div> : null}
+          <div className="wsTopActions">
+            <a href="/console" className="wsTopPill" title="Xem hàng đợi duyệt draft tại Operations">
+              <strong>{draftsTotal.pending}</strong>
+              <span>draft chờ duyệt</span>
+              <em>↗</em>
+            </a>
+            <button
+              type="button"
+              className="wsTopCta"
+              onClick={() => setShowCreateDrawer(true)}
+            >
+              + Đợt mới
+            </button>
+          </div>
+        </header>
 
-        <section className="workspaceMainGrid">
-          <article className="panel workspaceColumnLeft">
-            <h3>Tạo Search Job</h3>
-            <form onSubmit={handleCreateSearch} className="workspaceFormGrid">
-              <input placeholder="Tên công ty *" value={searchForm.companyName} onChange={(event) => setSearchForm((prev) => ({ ...prev, companyName: event.target.value }))} required />
-              <input placeholder="Region" value={searchForm.region} onChange={(event) => setSearchForm((prev) => ({ ...prev, region: event.target.value }))} />
-              <input placeholder="Industry" value={searchForm.industry} onChange={(event) => setSearchForm((prev) => ({ ...prev, industry: event.target.value }))} />
-              <button type="submit">Bắt đầu tìm</button>
-              <button type="button" className="ghostAction" onClick={() => void refreshAll()} disabled={loading}>{loading ? 'Đang tải...' : 'Làm mới dữ liệu'}</button>
-            </form>
-          </article>
+        {errorText ? <div className="alert wsAlert">{errorText}</div> : null}
+        {notice ? <div className="successAlert wsAlert">{notice}</div> : null}
 
-          <article className="panel">
-            <div className="panelHead"><h3>Search Jobs</h3><span>{jobs.total} jobs</span></div>
-            <div className="tableWrap">
-              <table>
-                <thead><tr><th>Company</th><th>Status</th><th>Prospects</th><th>Created</th></tr></thead>
-                <tbody>
-                  {!jobs.items.length ? <tr><td colSpan={4}>Chưa có job.</td></tr> : jobs.items.map((job) => (
-                    <tr key={job.id} className={selectedJobId === job.id ? 'selected' : ''} onClick={() => setSelectedJobId(job.id)}>
-                      <td>{job.keyword}</td>
-                      <td><span className={`statusBadge status-${job.status}`}>{job.status}</span></td>
-                      <td>{job.total_prospects}</td>
-                      <td>{formatDate(job.created_at)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+        {/* TWO-COLUMN BODY */}
+        <div className="wsBody">
+          {/* SIDEBAR: JOB LIST */}
+          <aside className="wsSidebar">
+            <div className="wsSidebarHead">
+              <strong>Đợt tìm kiếm</strong>
+              <span>{jobs.total}</span>
             </div>
-          </article>
-        </section>
-
-        <section className="panel" style={{ marginTop: '0.9rem' }}>
-          <div className="panelHead"><h3>Raw Crawl Data</h3><span>{rawSnapshots.total} bản ghi</span></div>
-          <div className="toolbar">
-            <input placeholder="source" value={rawFilters.source} onChange={(event) => setRawFilters((prev) => ({ ...prev, source: event.target.value }))} />
-            <input placeholder="entity type" value={rawFilters.entityType} onChange={(event) => setRawFilters((prev) => ({ ...prev, entityType: event.target.value }))} />
-            <button onClick={() => void loadRawSnapshots()} disabled={!selectedJobId || loading}>Lọc dữ liệu</button>
-          </div>
-          <div className="tableWrap">
-            <table>
-              <thead><tr><th>Source</th><th>Entity Type</th><th>Entity Id</th><th>Created</th></tr></thead>
-              <tbody>
-                {!rawSnapshots.items.length ? <tr><td colSpan={4}>Chưa có raw snapshot.</td></tr> : rawSnapshots.items.map((item) => (
-                  <tr key={item.id} className={selectedRawSnapshotId === item.id ? 'selected' : ''} onClick={() => setSelectedRawSnapshotId(item.id)}>
-                    <td>{item.source}</td><td>{item.entity_type}</td><td>{item.entity_id ?? '-'}</td><td>{formatDate(item.created_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {selectedRawSnapshot ? <pre className="payloadBox" style={{ marginTop: '0.8rem' }}>{JSON.stringify(selectedRawSnapshot.raw_json, null, 2)}</pre> : null}
-        </section>
-
-        <section className="panel" style={{ marginTop: '0.9rem' }}>
-          <div className="panelHead"><h3>Prospects</h3><span>{prospects.total} prospects</span></div>
-          <div className="tableWrap">
-            <table>
-              <thead><tr><th>Company</th><th>Person</th><th>Email</th><th>Status</th><th>Source</th></tr></thead>
-              <tbody>
-                {!prospects.items.length ? <tr><td colSpan={5}>Chưa có prospect.</td></tr> : prospects.items.map((prospect) => (
-                  <tr key={prospect.id} className={selectedProspectId === prospect.id ? 'selected' : ''} onClick={() => setSelectedProspectId(prospect.id)}>
-                    <td>{prospect.company}</td><td>{prospect.person_name}</td><td>{prospect.email ?? '-'}</td><td>{prospect.status}</td><td>{prospect.source}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="inlineActions" style={{ marginTop: '0.8rem' }}>
-            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.45rem' }}>
-              <span>Model mode:</span>
-              <select value={reportModelKind} onChange={(event) => setReportModelKind(event.target.value as ReportModelKind)} disabled={loading}>
-                <option value="fast">fast</option>
-                <option value="balanced">balanced (mặc định)</option>
-                <option value="reasoning">reasoning</option>
-              </select>
-            </label>
-            <button onClick={() => void handleGenerateAndSaveReport()} disabled={!selectedProspectId || loading}>Xuất report AI (toàn bộ key persons)</button>
-            <button onClick={() => void handleGenerateDraft()} disabled={!selectedProspectId || loading}>Tạo draft và gửi Telegram review</button>
-          </div>
-          {selectedProspect ? (
-            <p className="notice" style={{ marginTop: '0.7rem' }}>
-              Prospect đã chọn: <strong>{selectedProspect.company}</strong> - {selectedProspect.person_name}
-              <br />
-              <small>Lưu ý: lựa chọn này chỉ là điểm kích hoạt API. Report công ty sẽ tổng hợp tất cả key persons của công ty trong search job hiện tại.</small>
-            </p>
-          ) : null}
-        </section>
-
-        <section className="workspaceBottomGrid" style={{ marginTop: '0.9rem' }}>
-          <article className="panel">
-            <h3>AI Company Report</h3>
-            {report ? (
-              <>
-                <div className="reportMeta">
-                  <span>Provider: {report.provider}</span>
-                  <span>Sources: {report.source_count}</span>
-                  <span>Score: {report.confidence_score ?? 'N/A'}</span>
-                  <button className="ghostAction" onClick={() => void handleDownloadLatex()} type="button">Tải .tex</button>
-                  <button className="ghostAction" onClick={() => void handleDownloadPdf()} type="button">Tải PDF (server)</button>
-                  <button className="ghostAction" onClick={handleExportReportPdf} type="button">Xuất PDF</button>
-                </div>
-                {(() => {
-                  const json = readObj(report.report_json);
-                  if (!json) {
-                    return <pre className="payloadBox reportMarkdown">{report.report_markdown}</pre>;
-                  }
-
-                  const overview = readObj(json.company_overview) ?? {};
-                  const keyPerson = readObj(json.key_person) ?? {};
-                  const allKeyPersonsRaw = Array.isArray(json.all_key_persons) ? json.all_key_persons : [];
-                  const allKeyPersons = allKeyPersonsRaw
-                    .map((item) => readObj(item))
-                    .filter((item): item is Record<string, unknown> => item !== null);
-                  const buyingSignals = readStrArray(json.buying_signals);
-                  const risks = readStrArray(json.risks);
-                  const nextSteps = readStrArray(json.recommended_next_steps);
-                  const dataQuality = readStrArray(json.data_quality_notes);
-
-                  return (
-                    <div className="reportCard">
-                      <h4>Tóm tắt điều hành</h4>
-                      <p>{readStr(json.executive_summary)}</p>
-
-                      <h4>Company Overview</h4>
-                      <div className="reportGrid">
-                        <div><strong>Domain:</strong> {readStr(overview.domain)}</div>
-                        <div><strong>Industry:</strong> {readStr(overview.industry)}</div>
-                        <div><strong>Region:</strong> {readStr(overview.region)}</div>
-                      </div>
-                      <p><strong>Summary:</strong> {readStr(overview.summary)}</p>
-
-                      <h4>Key Person (điểm kích hoạt)</h4>
-                      <div className="reportGrid">
-                        <div><strong>Name:</strong> {readStr(keyPerson.name)}</div>
-                        <div><strong>Title:</strong> {readStr(keyPerson.title)}</div>
-                        <div><strong>Email:</strong> {readStr(keyPerson.email)}</div>
-                        <div><strong>Phone:</strong> {readStr(keyPerson.phone)}</div>
-                      </div>
-
-                      <h4>All Key Persons ({allKeyPersons.length})</h4>
-                      <div className="tableWrap">
-                        <table>
-                          <thead><tr><th>Name</th><th>Title</th><th>Email</th><th>Phone</th><th>Confidence</th><th>Source</th></tr></thead>
-                          <tbody>
-                            {!allKeyPersons.length ? (
-                              <tr><td colSpan={6}>N/A</td></tr>
-                            ) : allKeyPersons.map((item, idx) => (
-                              <tr key={`${readStr(item.name)}-${idx}`}>
-                                <td>{readStr(item.name)}</td>
-                                <td>{readStr(item.title)}</td>
-                                <td>{readStr(item.email)}</td>
-                                <td>{readStr(item.phone)}</td>
-                                <td>{typeof item.confidence_0_1 === 'number' ? Number(item.confidence_0_1).toFixed(2) : 'N/A'}</td>
-                                <td>{readStr(item.source)}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      <h4>Buying Signals</h4>
-                      <ul>{buyingSignals.length ? buyingSignals.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
-
-                      <h4>Risks</h4>
-                      <ul>{risks.length ? risks.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
-
-                      <h4>Recommended Next Steps</h4>
-                      <ul>{nextSteps.length ? nextSteps.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
-
-                      <h4>Data Quality Notes</h4>
-                      <ul>{dataQuality.length ? dataQuality.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+            <input
+              className="wsSidebarSearch"
+              placeholder="Tìm theo tên / ngành / khu vực"
+              value={jobFilter}
+              onChange={(event) => setJobFilter(event.target.value)}
+            />
+            <div className="wsJobList">
+              {!filteredJobs.length ? (
+                <p className="wsEmpty wsEmptySmall">
+                  {jobs.total === 0 ? 'Chưa có đợt nào. Bấm "+ Đợt mới" để bắt đầu.' : 'Không khớp bộ lọc.'}
+                </p>
+              ) : (
+                filteredJobs.map((job) => (
+                  <button
+                    type="button"
+                    key={job.id}
+                    className={`wsJobRow ${selectedJobId === job.id ? 'selected' : ''}`}
+                    onClick={() => setSelectedJobId(job.id)}
+                  >
+                    <div className="wsJobRowTop">
+                      <span className="wsJobName">{job.keyword}</span>
+                      <span className={`statusBadge status-${job.status}`}>{job.status}</span>
                     </div>
-                  );
-                })()}
-              </>
-            ) : <p className="notice">Chưa có report.</p>}
-          </article>
-
-          <article className="panel">
-            <h3>Telegram Review Queue (không hiển thị nội dung draft)</h3>
-            <div className="tableWrap">
-              <table>
-                <thead><tr><th>Draft</th><th>Status</th><th>Mode</th><th>Edits</th><th>Created</th><th>Approved</th><th>Sent</th></tr></thead>
-                <tbody>
-                  {!drafts.items.length ? <tr><td colSpan={7}>Chưa có draft.</td></tr> : drafts.items.map((draft) => (
-                    <tr key={draft.id}>
-                      <td>{draft.id.slice(0, 8)}...</td>
-                      <td>{draft.status}</td>
-                      <td>{draft.compose_mode}</td>
-                      <td>{draft.edit_count}</td>
-                      <td>{formatDate(draft.created_at)}</td>
-                      <td>{formatDate(draft.approved_at)}</td>
-                      <td>{formatDate(draft.sent_at)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                    <div className="wsJobRowMeta">
+                      <span>{job.region ?? 'Global'}</span>
+                      <span>·</span>
+                      <span>{job.industry ?? 'Chưa phân loại'}</span>
+                      <span>·</span>
+                      <span>{job.total_prospects} prospect</span>
+                    </div>
+                    <div className="wsJobRowFoot">{formatRelative(job.created_at)}</div>
+                  </button>
+                ))
+              )}
             </div>
-            <p className="notice" style={{ marginTop: '0.7rem' }}>
-              Chỉnh sửa/approve/reject thực hiện trong Telegram Bot theo đúng quy trình CEO và Sales Team.
-            </p>
-          </article>
-        </section>
+          </aside>
 
-        <section className="panel" style={{ marginTop: '0.9rem' }}>
-          <div className="panelHead"><h3>Email History (Safe Mode)</h3><span>{emailHistory.total} bản ghi</span></div>
-          <div className="tableWrap">
-            <table>
-              <thead><tr><th>Status</th><th>Intended</th><th>Actual</th><th>Redirected</th><th>Subject</th><th>Sent</th></tr></thead>
-              <tbody>
-                {!emailHistory.items.length ? <tr><td colSpan={6}>Chưa có email history.</td></tr> : emailHistory.items.map((row) => (
-                  <tr key={row.id}>
-                    <td>{row.status}</td>
-                    <td>{row.intended_recipient}</td>
-                    <td>{row.actual_recipient}</td>
-                    <td>{row.redirected ? 'yes' : 'no'}</td>
-                    <td>{row.subject}</td>
-                    <td>{formatDate(row.sent_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
+          {/* MAIN */}
+          <section className="wsMain">
+            {stage === 'no-job' ? (
+              <div className="wsHero">
+                <p className="eyebrow">Bắt đầu một đợt mới</p>
+                <h1>Chọn đợt ở bên trái, hoặc tạo đợt mới.</h1>
+                <p>Workspace dẫn bạn đi qua 3 bước: chọn prospect → tạo báo cáo công ty → tạo draft email để CEO duyệt qua Telegram.</p>
+                <button type="button" className="wsHeroCta" onClick={() => setShowCreateDrawer(true)}>+ Tạo đợt tìm kiếm</button>
+              </div>
+            ) : (
+              <>
+                {/* PROSPECTS */}
+                <section className="wsCard">
+                  <header className="wsCardHead">
+                    <div>
+                      <p className="eyebrow">1 — Prospects</p>
+                      <h2>Chọn người để tiếp cận</h2>
+                    </div>
+                    <span className="wsCardMeta">{prospects.total} prospect</span>
+                  </header>
+
+                  {!prospects.items.length ? (
+                    <p className="wsEmpty">
+                      {selectedJob?.status === 'running' || selectedJob?.status === 'queued'
+                        ? 'Đợt đang chạy. Khi có prospect, danh sách sẽ hiện ở đây.'
+                        : 'Chưa có prospect nào trong đợt này.'}
+                    </p>
+                  ) : (
+                    <div className="wsProspectList">
+                      {prospects.items.map((prospect) => (
+                        <button
+                          type="button"
+                          key={prospect.id}
+                          className={`wsProspectRow ${selectedProspectId === prospect.id ? 'selected' : ''}`}
+                          onClick={() => setSelectedProspectId(prospect.id)}
+                        >
+                          <div className="wsProspectMain">
+                            <strong>{prospect.person_name}</strong>
+                            <span>{prospect.position ?? 'Chưa có chức danh'}</span>
+                          </div>
+                          <div className="wsProspectMeta">
+                            <span className="wsProspectCo">{prospect.company}</span>
+                            <span className="wsProspectMail">{prospect.email ?? '—'}</span>
+                          </div>
+                          <div className="wsProspectTags">
+                            <span className="wsTag">{prospect.status}</span>
+                            <span className="wsTag wsTagMuted">{prospect.source}</span>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
+                {/* ACTION CARD: only if a prospect is selected */}
+                {selectedProspect ? (
+                  <section className={`wsCard wsActionCard ${stage === 'ready' ? 'pulse' : ''}`}>
+                    <header className="wsCardHead">
+                      <div>
+                        <p className="eyebrow">2 — Action</p>
+                        <h2>
+                          {selectedProspect.person_name}
+                          <span className="wsActionSub"> · {selectedProspect.company}</span>
+                        </h2>
+                      </div>
+                      <span className="wsCardMeta">{selectedProspect.email ?? 'Chưa có email'}</span>
+                    </header>
+
+                    <div className="wsActionGrid">
+                      <label className="wsActionField">
+                        <span>Chế độ model</span>
+                        <select
+                          value={reportModelKind}
+                          onChange={(event) => setReportModelKind(event.target.value as ReportModelKind)}
+                          disabled={reportGenerating || draftGenerating}
+                        >
+                          <option value="fast">fast — nhanh, ít chi tiết</option>
+                          <option value="balanced">balanced — mặc định</option>
+                          <option value="reasoning">reasoning — sâu, lâu hơn</option>
+                        </select>
+                      </label>
+
+                      <button
+                        type="button"
+                        className="wsActionPrimary"
+                        onClick={() => void handleGenerateAndSaveReport()}
+                        disabled={!selectedProspectId || reportGenerating || draftGenerating}
+                      >
+                        <span>{reportGenerating ? 'Đang tạo báo cáo…' : 'Tạo báo cáo công ty'}</span>
+                        <em>{reportGenerating ? '⏳' : '→'}</em>
+                      </button>
+
+                      <button
+                        type="button"
+                        className="wsActionSecondary"
+                        onClick={() => void handleGenerateDraft()}
+                        disabled={!selectedProspectId || reportGenerating || draftGenerating}
+                      >
+                        <span>{draftGenerating ? 'Đang tạo draft…' : 'Tạo draft email'}</span>
+                        <em>{draftGenerating ? '⏳' : '↗ Telegram'}</em>
+                      </button>
+                    </div>
+                  </section>
+                ) : null}
+
+                {/* REPORT */}
+                {reportGenerating ? (
+                  <section ref={reportCardRef} className="wsCard wsReportLoading">
+                    <header className="wsCardHead">
+                      <div>
+                        <p className="eyebrow">3 — Report</p>
+                        <h2>
+                          <span className="wsSpinner" /> AI đang tạo báo cáo cho {selectedProspect?.company ?? 'prospect'}…
+                        </h2>
+                      </div>
+                      <span className="wsCardMeta">mode = {reportModelKind}</span>
+                    </header>
+                    <p className="wsReportLoadingHint">
+                      Đang tổng hợp dữ liệu từ raw snapshots, gọi {reportModelKind === 'reasoning' ? 'reasoning model (sâu, có thể 1-2 phút)' : reportModelKind === 'fast' ? 'fast model (~20 giây)' : 'balanced model (~30-60 giây)'} và lưu vào database. Không cần đóng trang.
+                    </p>
+                    <div className="wsSkeletonBody">
+                      <div className="wsSkeletonBlock" style={{ width: '40%', height: '1.1rem' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '92%' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '88%' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '70%' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '30%', height: '1.1rem', marginTop: '0.4rem' }} />
+                      <div className="wsSkeletonGrid">
+                        <div className="wsSkeletonBlock" />
+                        <div className="wsSkeletonBlock" />
+                        <div className="wsSkeletonBlock" />
+                        <div className="wsSkeletonBlock" />
+                      </div>
+                      <div className="wsSkeletonBlock" style={{ width: '34%', height: '1.1rem', marginTop: '0.4rem' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '60%' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '52%' }} />
+                    </div>
+                  </section>
+                ) : reportLoading ? (
+                  <section ref={reportCardRef} className="wsCard wsReportFetching">
+                    <header className="wsCardHead">
+                      <div>
+                        <p className="eyebrow">3 — Report</p>
+                        <h2>
+                          <span className="wsSpinner wsSpinnerBlue" /> Đang tải báo cáo đã lưu…
+                        </h2>
+                      </div>
+                    </header>
+                    <div className="wsSkeletonBody">
+                      <div className="wsSkeletonBlock" style={{ width: '36%', height: '1.1rem' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '90%' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '74%' }} />
+                      <div className="wsSkeletonBlock" style={{ width: '60%' }} />
+                    </div>
+                  </section>
+                ) : report ? (
+                  <section ref={reportCardRef} className="wsCard wsReportCard">
+                    <header className="wsCardHead">
+                      <div>
+                        <p className="eyebrow">3 — Report</p>
+                        <h2>{report.company_name}</h2>
+                      </div>
+                      <div className="reportMeta wsReportMeta">
+                        <span>{report.provider}</span>
+                        <span>{report.source_count} nguồn</span>
+                        <span>score {report.confidence_score ?? 'N/A'}</span>
+                        <span>{formatRelative(report.generated_at)}</span>
+                      </div>
+                    </header>
+
+                    <div className="wsReportActions">
+                      <button type="button" className="ghostAction smallBtn" onClick={() => void handleDownloadLatex()}>Tải .tex</button>
+                      <button type="button" className="ghostAction smallBtn" onClick={() => void handleDownloadPdf()}>Tải PDF (server)</button>
+                      <button type="button" className="ghostAction smallBtn" onClick={handleExportReportPdf}>Xuất PDF (in)</button>
+                    </div>
+
+                    <ReportBody report={report} />
+                  </section>
+                ) : selectedProspect ? (
+                  <section className="wsCard wsReportPlaceholder">
+                    <p className="eyebrow">3 — Report</p>
+                    <p className="wsEmpty">Chưa có báo cáo cho prospect này. Bấm "Tạo báo cáo công ty" ở trên.</p>
+                  </section>
+                ) : null}
+
+                {/* RAW DATA (collapsed) */}
+                <section className="wsCollapse">
+                  <button
+                    type="button"
+                    className="wsCollapseHead"
+                    onClick={() => setShowRawData((prev) => !prev)}
+                  >
+                    <span>{showRawData ? '▼' : '▶'}</span>
+                    <strong>Dữ liệu nguồn của đợt này</strong>
+                    <span className="wsCardMeta">{rawSnapshots.total || '—'} bản ghi</span>
+                  </button>
+                  {showRawData ? (
+                    <div className="wsCollapseBody">
+                      {!rawSnapshots.items.length ? (
+                        <p className="wsEmpty wsEmptySmall">Chưa có raw snapshot.</p>
+                      ) : (
+                        <>
+                          <div className="tableWrap">
+                            <table>
+                              <thead>
+                                <tr>
+                                  <th>Source</th>
+                                  <th>Entity</th>
+                                  <th>ID</th>
+                                  <th>Tạo lúc</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {rawSnapshots.items.map((item) => (
+                                  <tr
+                                    key={item.id}
+                                    className={selectedRawSnapshotId === item.id ? 'selected' : ''}
+                                    onClick={() => setSelectedRawSnapshotId(item.id)}
+                                  >
+                                    <td>{item.source}</td>
+                                    <td>{item.entity_type}</td>
+                                    <td>{item.entity_id ?? '-'}</td>
+                                    <td>{formatDate(item.created_at)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          {selectedRawSnapshot ? (
+                            <pre className="payloadBox wsRawPayload">{JSON.stringify(selectedRawSnapshot.raw_json, null, 2)}</pre>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  ) : null}
+                </section>
+              </>
+            )}
+          </section>
+        </div>
       </div>
+
+      {/* CREATE DRAWER */}
+      {showCreateDrawer ? (
+        <div className="wsDrawerOverlay" onClick={() => setShowCreateDrawer(false)}>
+          <div className="wsDrawer" onClick={(event) => event.stopPropagation()}>
+            <header className="wsDrawerHead">
+              <div>
+                <p className="eyebrow">Đợt tìm kiếm mới</p>
+                <h2>Mở một đợt tìm công ty</h2>
+              </div>
+              <button type="button" className="wsDrawerClose" onClick={() => setShowCreateDrawer(false)}>✕</button>
+            </header>
+            <form onSubmit={handleCreateSearch} className="wsDrawerForm">
+              <label>
+                <span>Tên công ty *</span>
+                <input
+                  placeholder="ví dụ: Vietcombank"
+                  value={searchForm.companyName}
+                  onChange={(event) => setSearchForm((prev) => ({ ...prev, companyName: event.target.value }))}
+                  required
+                  autoFocus
+                />
+              </label>
+              <label>
+                <span>Khu vực</span>
+                <input
+                  placeholder="VN, US, APAC…"
+                  value={searchForm.region}
+                  onChange={(event) => setSearchForm((prev) => ({ ...prev, region: event.target.value }))}
+                />
+              </label>
+              <label>
+                <span>Ngành / thị trường</span>
+                <input
+                  placeholder="Banking, Fintech, eCommerce…"
+                  value={searchForm.industry}
+                  onChange={(event) => setSearchForm((prev) => ({ ...prev, industry: event.target.value }))}
+                />
+              </label>
+              <div className="wsDrawerFoot">
+                <button type="button" className="ghostAction" onClick={() => setShowCreateDrawer(false)}>Huỷ</button>
+                <button type="submit">Bắt đầu tìm</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
     </main>
+  );
+}
+
+function ReportBody({ report }: { report: ProspectCompanyReport }) {
+  const json = readObj(report.report_json);
+  if (!json) {
+    return <pre className="payloadBox reportMarkdown">{report.report_markdown}</pre>;
+  }
+
+  const overview = readObj(json.company_overview) ?? {};
+  const keyPerson = readObj(json.key_person) ?? {};
+  const firmographics = readObj(json.firmographics) ?? {};
+  const allKeyPersonsRaw = Array.isArray(json.all_key_persons) ? json.all_key_persons : [];
+  const allKeyPersons = allKeyPersonsRaw
+    .map((item) => readObj(item))
+    .filter((item): item is Record<string, unknown> => item !== null);
+  const outreachHooksRaw = Array.isArray(json.outreach_hooks) ? json.outreach_hooks : [];
+  const outreachHooks = outreachHooksRaw
+    .map((item) => readObj(item))
+    .filter((item): item is Record<string, unknown> => item !== null);
+  const sourcesRaw = Array.isArray(json.sources) ? json.sources : [];
+  const sources = sourcesRaw
+    .map((item) => readObj(item))
+    .filter((item): item is Record<string, unknown> => item !== null);
+  const buyingSignals = readStrArray(json.buying_signals);
+  const risks = readStrArray(json.risks);
+  const nextSteps = readStrArray(json.recommended_next_steps);
+  const dataQuality = readStrArray(json.data_quality_notes);
+
+  return (
+    <div className="reportCard wsReportBody">
+      <h4>Tóm tắt điều hành</h4>
+      <p>{readStr(json.executive_summary)}</p>
+
+      <h4>Company Overview</h4>
+      <div className="reportGrid">
+        <div><strong>Domain:</strong> {readStr(overview.domain)}</div>
+        <div><strong>Industry:</strong> {readStr(overview.industry)}</div>
+        <div><strong>Region:</strong> {readStr(overview.region)}</div>
+      </div>
+      <p><strong>Summary:</strong> {readStr(overview.summary)}</p>
+
+      <h4>Firmographics</h4>
+      <div className="reportGrid">
+        <div><strong>Nhân sự:</strong> {readStr(firmographics.employee_count_range)}</div>
+        <div><strong>Doanh thu:</strong> {readStr(firmographics.revenue_range_usd)}</div>
+        <div><strong>Funding stage:</strong> {readStr(firmographics.funding_stage)}</div>
+        <div><strong>Thành lập:</strong> {typeof firmographics.founded_year === 'number' ? String(firmographics.founded_year) : 'N/A'}</div>
+      </div>
+
+      <h4>Key Person (điểm kích hoạt)</h4>
+      <div className="reportGrid">
+        <div><strong>Name:</strong> {readStr(keyPerson.name)}</div>
+        <div><strong>Title:</strong> {readStr(keyPerson.title)}</div>
+        <div><strong>Email:</strong> {readStr(keyPerson.email)}</div>
+        <div><strong>Phone:</strong> {readStr(keyPerson.phone)}</div>
+      </div>
+
+      <h4>All Key Persons ({allKeyPersons.length})</h4>
+      <div className="tableWrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Title</th>
+              <th>Email</th>
+              <th>Phone</th>
+              <th>Confidence</th>
+              <th>Source</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!allKeyPersons.length ? (
+              <tr><td colSpan={6}>N/A</td></tr>
+            ) : allKeyPersons.map((item, idx) => (
+              <tr key={`${readStr(item.name)}-${idx}`}>
+                <td>{readStr(item.name)}</td>
+                <td>{readStr(item.title)}</td>
+                <td>{readStr(item.email)}</td>
+                <td>{readStr(item.phone)}</td>
+                <td>{typeof item.confidence_0_1 === 'number' ? `${Math.round(Number(item.confidence_0_1) * 100)}%` : 'N/A'}</td>
+                <td>{readStr(item.source)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Outreach Hooks · cớ tiếp cận ({outreachHooks.length})</h4>
+      {!outreachHooks.length ? (
+        <p className="wsHookEmpty">Chưa tìm được hook cụ thể từ dữ liệu hiện có. AI khuyến nghị bổ sung snapshot LinkedIn/press release để cải thiện.</p>
+      ) : (
+        <ul className="wsHookList">
+          {outreachHooks.map((row, idx) => {
+            const hook = readStr(row.hook);
+            const useIn = readStr(row.use_in);
+            const evidence = typeof row.evidence_url === 'string' ? row.evidence_url : null;
+            return (
+              <li key={`${hook}-${idx}`} className="wsHookItem">
+                <span className={`wsHookTag wsHookTag-${useIn === 'N/A' ? 'opener' : useIn}`}>{useIn === 'N/A' ? 'opener' : useIn}</span>
+                <span className="wsHookText">{hook}</span>
+                {evidence ? (
+                  <a href={evidence} target="_blank" rel="noreferrer" className="wsHookEvidence">nguồn ↗</a>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      <h4>Buying Signals</h4>
+      <ul>{buyingSignals.length ? buyingSignals.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+
+      <h4>Risks</h4>
+      <ul>{risks.length ? risks.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+
+      <h4>Recommended Next Steps</h4>
+      <ul>{nextSteps.length ? nextSteps.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+
+      <h4>Nguồn dẫn chứng ({sources.length})</h4>
+      {!sources.length ? (
+        <p className="wsHookEmpty">Không có URL nguồn nào kèm theo report này.</p>
+      ) : (
+        <ul className="wsSourceList">
+          {sources.map((row, idx) => {
+            const url = typeof row.url === 'string' ? row.url : '';
+            const title = readStr(row.title);
+            const claim = typeof row.claim_supported === 'string' ? row.claim_supported : null;
+            return (
+              <li key={`${url}-${idx}`}>
+                <a href={url} target="_blank" rel="noreferrer">{title !== 'N/A' ? title : url}</a>
+                {claim ? <span className="wsSourceClaim"> — dẫn chứng cho: <code>{claim}</code></span> : null}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      <h4>Data Quality Notes</h4>
+      <ul>{dataQuality.length ? dataQuality.map((it) => <li key={it}>{it}</li>) : <li>N/A</li>}</ul>
+    </div>
   );
 }

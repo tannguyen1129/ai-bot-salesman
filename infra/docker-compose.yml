@@ -18,6 +18,9 @@ services:
       - "4000:4000"
     env_file:
       - ../.env
+    environment:
+      P1_PROCESS_ROLE: api
+      P1_BOUNCE_LISTENER_ROLE: worker
     depends_on:
       - postgres
       - redis
@@ -29,9 +32,15 @@ services:
     command: ["npm", "run", "start:worker", "--workspace=@vnetwork/api"]
     env_file:
       - ../.env
+    environment:
+      P1_PROCESS_ROLE: worker
+      P1_BOUNCE_LISTENER_ROLE: worker
+      # API container handles migrations on boot; worker skips to avoid a race.
+      SKIP_MIGRATE: "true"
     depends_on:
       - postgres
       - redis
+      - api
 
   postgres:
     image: pgvector/pgvector:pg16

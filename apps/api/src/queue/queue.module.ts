@@ -19,7 +19,8 @@ import { BullModule } from '@nestjs/bullmq';
     BullModule.registerQueue(
       { name: 'p1-sheets-sync' },
       { name: 'p1-discovery' },
-      { name: 'p1-email-send' }
+      { name: 'p1-email-send' },
+      { name: 'p1-telegram-snooze' }
     )
   ],
   exports: [BullModule]

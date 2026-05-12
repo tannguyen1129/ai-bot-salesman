@@ -97,7 +97,36 @@ export interface ProspectCompanyReportResult {
   reportJson: Record<string, unknown>;
   provider: 'openai' | 'gemini' | 'fallback';
   confidenceScore: number | null;
+  industryNormalized: IndustryNormalized | null;
+  industryConfidence: number | null;
 }
+
+export interface CompanyAliasResult {
+  canonical: string | null;
+  aliases: string[];
+  provider: 'openai' | 'gemini' | 'fallback';
+}
+
+export const INDUSTRY_NORMALIZED_VALUES = [
+  'securities',
+  'banking',
+  'fintech',
+  'insurance',
+  'ecommerce',
+  'manufacturing',
+  'logistics',
+  'retail',
+  'education',
+  'healthcare',
+  'real_estate',
+  'media',
+  'technology',
+  'telecom',
+  'government',
+  'energy',
+  'other'
+] as const;
+export type IndustryNormalized = (typeof INDUSTRY_NORMALIZED_VALUES)[number];
 
 @Injectable()
 export class OpenAiClient {
@@ -207,6 +236,79 @@ export class OpenAiClient {
     return { ok: true, model };
   }
 
+  /**
+   * Expand a user-typed company name into the canonical legal name plus common aliases.
+   * Used by the discovery pipeline so external APIs (Apollo, LinkedIn, Hunter) can match
+   * records that store the long form (e.g. user types "Vietcombank" → we query both
+   * "Vietcombank" and "Joint Stock Commercial Bank for Foreign Trade of Vietnam").
+   */
+  async expandCompanyAliases(input: { query: string; region?: string | null }): Promise<CompanyAliasResult> {
+    const trimmedQuery = (input.query ?? '').trim();
+    if (!trimmedQuery) {
+      return { canonical: null, aliases: [], provider: 'fallback' };
+    }
+    if (!this.hasProviderKey()) {
+      return { canonical: null, aliases: [], provider: 'fallback' };
+    }
+
+    const prompt = [
+      'Bạn là chuyên gia định danh doanh nghiệp Việt Nam và quốc tế.',
+      'Cho 1 query người dùng nhập (có thể là tên viết tắt, mã ticker, hoặc tên rút gọn).',
+      'Trả về DUY NHẤT 1 JSON object với schema:',
+      JSON.stringify(
+        {
+          canonical: 'string|null — tên đầy đủ, chính thức (legal name), thường là tên đăng ký kinh doanh',
+          aliases: ['string — các tên gọi phổ biến khác: viết tắt, tên tiếng Anh, tên tiếng Việt, mã ticker, brand name; KHÔNG lặp lại canonical']
+        },
+        null,
+        2
+      ),
+      '',
+      `Query: ${JSON.stringify(trimmedQuery)}`,
+      `Region: ${JSON.stringify(input.region ?? 'VN')}`,
+      '',
+      'Quy tắc:',
+      '- canonical: nếu là doanh nghiệp Việt Nam, ưu tiên tên đầy đủ Tiếng Anh (vì các nguồn dữ liệu B2B như Apollo dùng Tiếng Anh). Vd: "Vietcombank" → "Joint Stock Commercial Bank for Foreign Trade of Vietnam".',
+      '- aliases: 2-5 biến thể, gồm cả tên Tiếng Việt đầy đủ ("Ngân hàng TMCP Ngoại thương Việt Nam"), viết tắt ("VCB"), brand name, không nhắc lại canonical.',
+      '- Nếu KHÔNG chắc chắn (không nhận ra doanh nghiệp), trả canonical=null và aliases=[].',
+      '- TUYỆT ĐỐI không bịa tên doanh nghiệp không tồn tại.',
+      'Trả JSON, không markdown, không text ngoài JSON.'
+    ].join('\n');
+
+    const generated = await this.generateText(prompt, 'fast');
+    if (!generated.text) {
+      return { canonical: null, aliases: [], provider: 'fallback' };
+    }
+    const parsed = this.safeParseCleanJson(generated.text);
+    if (!parsed) {
+      return { canonical: null, aliases: [], provider: 'fallback' };
+    }
+
+    const canonical = this.readString(parsed.canonical);
+    const aliasesRaw = Array.isArray(parsed.aliases) ? parsed.aliases : [];
+    const aliases = aliasesRaw
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .map((item) => item.trim());
+
+    // Dedup case-insensitively, drop entries equal to the user-typed query or to canonical.
+    const seen = new Set<string>();
+    if (canonical) seen.add(canonical.toLowerCase());
+    seen.add(trimmedQuery.toLowerCase());
+    const dedupedAliases: string[] = [];
+    for (const alias of aliases) {
+      const key = alias.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      dedupedAliases.push(alias);
+    }
+
+    return {
+      canonical,
+      aliases: dedupedAliases.slice(0, 5),
+      provider: generated.provider
+    };
+  }
+
   async generateLeadAnalysis(input: {
     candidateName: string;
     icpName: string;
@@ -298,7 +400,8 @@ export class OpenAiClient {
     const prompt = [
       input.promptTemplate,
       '',
-      'Return strict JSON with keys: subject, body_text',
+      'Toàn bộ subject và body BẮT BUỘC viết bằng tiếng Việt có dấu, văn phong chuyên nghiệp, ngắn gọn, lịch sự, kèm CTA mời trao đổi 15-20 phút.',
+      'Trả về JSON nghiêm ngặt với key: subject, body_text.',
       `prospect: ${JSON.stringify(input.prospect)}`
     ].join('\n');
 
@@ -347,10 +450,11 @@ export class OpenAiClient {
     const prompt = [
       input.promptTemplate,
       '',
-      'Ban la sales assistant. Nhiem vu: ca nhan hoa NOI DUNG tu TEMPLATE SAN CO, khong viet lai tu dau.',
-      'Bat buoc giu giong van chuyen nghiep, ngan gon, co CTA.',
-      'Bat buoc giu cau chao mo dau neu da co trong template.',
-      'Return strict JSON with keys: subject, body_text',
+      'Bạn là Sales Assistant. Nhiệm vụ: cá nhân hóa NỘI DUNG từ TEMPLATE SẴN CÓ, KHÔNG viết lại từ đầu.',
+      'BẮT BUỘC giữ giọng văn chuyên nghiệp, ngắn gọn, có CTA, toàn bộ tiếng Việt có dấu.',
+      'BẮT BUỘC giữ nguyên câu chào mở đầu nếu đã có trong template.',
+      'Chỉ thay các placeholder/biến trong template bằng dữ liệu từ context, KHÔNG thêm đoạn mới ngoài template.',
+      'Trả về JSON nghiêm ngặt với key: subject, body_text.',
       `context: ${JSON.stringify(input.context)}`,
       `template_subject: ${JSON.stringify(input.templateSubject)}`,
       `template_body: ${JSON.stringify(input.templateBody)}`
@@ -395,9 +499,10 @@ export class OpenAiClient {
     const prompt = [
       input.promptTemplate,
       '',
-      'Ban la strategic B2B researcher. Nhiem vu: tong hop thong tin cong ty thanh bao cao action-ready cho sales.',
-      'Tra ve DUY NHAT 1 JSON object hop le, khong markdown.',
-      'Schema bat buoc:',
+      'Bạn là chuyên gia nghiên cứu B2B chiến lược. Nhiệm vụ: tổng hợp thông tin công ty thành bản báo cáo sẵn-sàng-hành-động cho đội Sales.',
+      'NGÔN NGỮ: toàn bộ nội dung văn xuôi (executive_summary, company_overview.summary, buying_signals, risks, recommended_next_steps, data_quality_notes) BẮT BUỘC viết bằng tiếng Việt có dấu, văn phong chuyên nghiệp, ngắn gọn, không dùng emoji.',
+      'Trả về DUY NHẤT một JSON object hợp lệ, KHÔNG kèm markdown, KHÔNG kèm văn bản ngoài JSON.',
+      'Schema bắt buộc:',
       JSON.stringify(
         {
           executive_summary: 'string',
@@ -428,17 +533,43 @@ export class OpenAiClient {
           buying_signals: ['string'],
           risks: ['string'],
           recommended_next_steps: ['string'],
+          outreach_hooks: [
+            {
+              hook: 'string (sự kiện/tín hiệu cụ thể có thể dùng làm cớ tiếp cận)',
+              evidence_url: 'string|null',
+              use_in: 'enum (subject|opener|follow_up)'
+            }
+          ],
+          firmographics: {
+            employee_count_range: 'string|null (vd: "100-500", "1k-5k")',
+            revenue_range_usd: 'string|null (vd: "10M-50M USD")',
+            funding_stage: 'string|null (vd: "Series B", "Bootstrapped", "Public")',
+            founded_year: 'number|null'
+          },
+          sources: [
+            {
+              url: 'string (URL nguồn có thể truy cập)',
+              title: 'string|null (tiêu đề trang/bài viết)',
+              claim_supported: 'string|null (claim trong report mà nguồn này dẫn chứng)'
+            }
+          ],
           qualification_score_100: 'number|null',
-          data_quality_notes: ['string']
+          data_quality_notes: ['string'],
+          industry_normalized: `enum (${INDUSTRY_NORMALIZED_VALUES.join('|')})`,
+          industry_confidence: 'number 0..1'
         },
         null,
         2
       ),
-      `Prospect normalized input: ${JSON.stringify(input.prospect)}`,
-      `All key persons in this company/job: ${JSON.stringify(input.relatedKeyPersons ?? [])}`,
-      `Cleaned AI profile: ${JSON.stringify(input.cleanedProfile ?? null)}`,
-      `Raw snapshots(sample): ${JSON.stringify(this.trimSnapshots(input.snapshots))}`,
-      'Yeu cau: tong hop DAY DU all_key_persons, khong bo sot nguoi. Viet ngan gon, dung du lieu thuc te tu input, khong bịa.'
+      `Prospect đã chuẩn hóa: ${JSON.stringify(input.prospect)}`,
+      `Toàn bộ key persons trong công ty/job: ${JSON.stringify(input.relatedKeyPersons ?? [])}`,
+      `Hồ sơ AI đã làm sạch: ${JSON.stringify(input.cleanedProfile ?? null)}`,
+      `Mẫu raw snapshots: ${JSON.stringify(this.trimSnapshots(input.snapshots))}`,
+      'Yêu cầu: tổng hợp ĐẦY ĐỦ all_key_persons, không bỏ sót người. Viết ngắn gọn, chỉ dùng dữ liệu thực tế từ input, KHÔNG bịa thông tin không có trong nguồn.',
+      'outreach_hooks: mỗi hook là một sự kiện/tín hiệu CỤ THỂ Sales có thể dùng làm cớ mở đầu (vd: "Vừa promote lên CIO 2 tháng trước", "Tuần trước có thông cáo về cloud migration"). KHÔNG viết generic như "ngành đang chuyển đổi số". Mỗi hook BẮT BUỘC có evidence_url khi có thể trích từ snapshot; nếu không có URL gốc, để null. Tối thiểu 1-3 hook nếu input đủ dữ liệu; nếu không tìm được hook cụ thể, trả mảng rỗng [].',
+      'firmographics: chỉ điền các field có nguồn rõ ràng; field nào không có dữ liệu thì để null, KHÔNG đoán.',
+      'sources: liệt kê các URL nguồn dùng trong báo cáo (bóc từ raw snapshots nếu có). Mỗi item có URL + title + claim_supported (claim nào trong report dẫn chứng từ nguồn này — vd: "key_person.email", "buying_signals[0]"). Nếu không có URL rõ ràng, trả mảng rỗng [].',
+      `industry_normalized BẮT BUỘC chọn một trong enum: ${INDUSTRY_NORMALIZED_VALUES.join(', ')}. Ánh xạ các ngành tiếng Việt/Anh về enum này (ví dụ: "Công ty chứng khoán" → securities; "Ngân hàng" → banking; "Thương mại điện tử/TMĐT" → ecommerce; "Công nghệ" → technology; "Sản xuất" → manufacturing). Nếu không xác định được, chọn "other" và đặt industry_confidence < 0.4.`
     ].join('\n');
 
     const generated = await this.generateText(prompt, input.modelKind ?? 'balanced');
@@ -460,13 +591,53 @@ export class OpenAiClient {
     const reportJson = this.normalizeProspectCompanyReport(parsed, fallback.reportJson);
     const reportMarkdown = this.renderProspectCompanyReportMarkdown(reportJson);
     const confidenceScore = this.readNumber(reportJson.qualification_score_100, 0, 100);
+    const industryNormalized = this.toIndustryEnum(reportJson.industry_normalized) ??
+      this.inferIndustryFromText(this.readString((reportJson.company_overview as Record<string, unknown> | undefined)?.industry));
+    const industryConfidence = this.readNumber(reportJson.industry_confidence, 0, 1);
 
     return {
       reportJson,
       reportMarkdown,
       confidenceScore,
-      provider: generated.provider
+      provider: generated.provider,
+      industryNormalized,
+      industryConfidence
     };
+  }
+
+  private toIndustryEnum(value: unknown): IndustryNormalized | null {
+    if (typeof value !== 'string') return null;
+    const key = value.trim().toLowerCase().replace(/\s+/g, '_');
+    return (INDUSTRY_NORMALIZED_VALUES as readonly string[]).includes(key)
+      ? (key as IndustryNormalized)
+      : null;
+  }
+
+  private inferIndustryFromText(industryText: string | null | undefined): IndustryNormalized | null {
+    const text = (industryText ?? '').toLowerCase();
+    if (!text.trim()) return null;
+    const rules: Array<[string[], IndustryNormalized]> = [
+      [['chứng khoán', 'chung khoan', 'securities', 'brokerage', 'broker'], 'securities'],
+      [['ngân hàng', 'ngan hang', 'bank'], 'banking'],
+      [['bảo hiểm', 'bao hiem', 'insurance'], 'insurance'],
+      [['fintech'], 'fintech'],
+      [['thương mại điện tử', 'thuong mai dien tu', 'tmdt', 'ecommerce', 'e-commerce', 'marketplace'], 'ecommerce'],
+      [['sản xuất', 'san xuat', 'manufactur', 'industrial'], 'manufacturing'],
+      [['logistics', 'vận tải', 'van tai', 'shipping', 'forwarder'], 'logistics'],
+      [['retail', 'bán lẻ', 'ban le'], 'retail'],
+      [['education', 'giáo dục', 'giao duc', 'edtech'], 'education'],
+      [['health', 'y tế', 'y te', 'pharma', 'hospital'], 'healthcare'],
+      [['real estate', 'bất động sản', 'bat dong san'], 'real_estate'],
+      [['media', 'truyền thông', 'truyen thong', 'publishing', 'broadcast'], 'media'],
+      [['telecom', 'viễn thông', 'vien thong', 'isp'], 'telecom'],
+      [['government', 'chính phủ', 'chinh phu', 'public sector'], 'government'],
+      [['energy', 'năng lượng', 'nang luong', 'oil', 'gas', 'điện', 'dien luc'], 'energy'],
+      [['saas', 'software', 'công nghệ', 'cong nghe', 'technology', 'ai ', 'platform'], 'technology']
+    ];
+    for (const [keywords, key] of rules) {
+      if (keywords.some((kw) => text.includes(kw))) return key;
+    }
+    return null;
   }
 
   private trimSnapshots(snapshots: ProspectRawSnapshot[]): ProspectRawSnapshot[] {
@@ -597,18 +768,18 @@ export class OpenAiClient {
   }
 
   private fallbackComposeDraft(prospect: ProspectComposeInput): { subject: string; bodyText: string } {
-    const industry = prospect.companyIndustry ?? 'doanh nghiep';
-    const title = prospect.personTitle ?? 'Anh/Chi';
+    const industry = prospect.companyIndustry ?? 'doanh nghiệp';
+    const title = prospect.personTitle ?? 'Anh/Chị';
     return {
-      subject: `De xuat trao doi ve giai phap bao mat cho ${prospect.companyName}`,
+      subject: `Đề xuất trao đổi về giải pháp bảo mật cho ${prospect.companyName}`,
       bodyText: [
-        `Kinh gui ${title} ${prospect.personName},`,
+        `Kính gửi ${title} ${prospect.personName},`,
         '',
-        `Em la tu van giai phap tai VNETWORK. Ben em da nghien cuu nhanh ve ${prospect.companyName} (${industry}) va nhan thay co the ho tro them cho bai toan an toan he thong va van hanh on dinh.`,
+        `Em là tư vấn giải pháp tại VNETWORK. Bên em đã nghiên cứu nhanh về ${prospect.companyName} (${industry}) và nhận thấy có thể hỗ trợ thêm cho bài toán an toàn hệ thống và vận hành ổn định.`,
         '',
-        'Neu Anh/Chi phu hop, em xin phep hen 15-20 phut de chia se de xuat tong quan.',
+        'Nếu Anh/Chị phù hợp, em xin phép hẹn 15-20 phút để chia sẻ đề xuất tổng quan.',
         '',
-        'Tran trong,',
+        'Trân trọng,',
         'VNETWORK Sales Team'
       ].join('\n')
     };
@@ -618,6 +789,8 @@ export class OpenAiClient {
     reportMarkdown: string;
     reportJson: Record<string, unknown>;
     confidenceScore: number | null;
+    industryNormalized: IndustryNormalized | null;
+    industryConfidence: number | null;
   } {
     const confidenceScore =
       input.cleanedProfile?.confidenceScore !== null && input.cleanedProfile?.confidenceScore !== undefined
@@ -629,9 +802,9 @@ export class OpenAiClient {
         : Array.from(new Set(input.snapshots.map((item) => item.source).filter(Boolean)));
     const summary =
       input.cleanedProfile?.companySummary ??
-      `${input.prospect.companyName} dang nam trong tap prospect can tiep can B2B. Nen bo sung du lieu doanh nghiep chi tiet de nang do chinh xac.`;
+      `${input.prospect.companyName} đang nằm trong tập prospect cần tiếp cận B2B. Cần bổ sung thêm dữ liệu doanh nghiệp chi tiết để nâng độ chính xác.`;
     const reportJson: Record<string, unknown> = {
-      executive_summary: `${input.prospect.companyName} la prospect trong nganh ${input.prospect.companyIndustry ?? 'chua ro'}. Muc do uu tien hien tai o muc trung binh va can them xac minh truoc khi outreach quy mo lon.`,
+      executive_summary: `${input.prospect.companyName} là prospect trong ngành ${input.prospect.companyIndustry ?? 'chưa rõ'}. Mức ưu tiên hiện tại ở mức trung bình và cần xác minh thêm trước khi triển khai outreach quy mô lớn.`,
       company_overview: {
         name: input.prospect.companyName,
         domain: input.prospect.companyDomain,
@@ -656,29 +829,45 @@ export class OpenAiClient {
           source: item.source
         })) ?? [],
       buying_signals: [
-        'Da xac dinh duoc key person de tiep can.',
-        'Da co company-domain va nganh co ban de phan loai lead.'
+        'Đã xác định được người liên hệ chính để tiếp cận.',
+        'Đã có tên miền công ty và ngành cơ bản để phân loại lead.'
       ],
       risks: [
-        'Thong tin quy mo va ngan sach chua du de du bao nhu cau mua.',
-        'Can bo sung them du lieu external de giam rui ro outreach sai doi tuong.'
+        'Thông tin về quy mô và ngân sách chưa đủ để dự báo nhu cầu mua.',
+        'Cần bổ sung thêm dữ liệu từ nguồn ngoài để giảm rủi ro outreach sai đối tượng.'
       ],
       recommended_next_steps: [
-        'Xac minh lai company profile tu website/LinkedIn trong 24h.',
-        'Chuan bi message mo dau theo nganh va pain point cu the.',
-        'Tien hanh outreach nho gon va theo doi phan hoi trong 3-5 ngay.'
+        'Xác minh lại hồ sơ công ty từ website/LinkedIn trong 24 giờ.',
+        'Chuẩn bị thông điệp mở đầu theo ngành và pain point cụ thể.',
+        'Tiến hành outreach nhỏ gọn và theo dõi phản hồi trong 3-5 ngày.'
       ],
+      outreach_hooks: [],
+      firmographics: {
+        employee_count_range: null,
+        revenue_range_usd: null,
+        funding_stage: null,
+        founded_year: null
+      },
+      sources: [],
       qualification_score_100: confidenceScore,
       data_quality_notes: [
-        sourceList.length > 0 ? `Nguon du lieu: ${sourceList.join(', ')}` : 'Nguon du lieu chua day du.',
-        input.cleanedProfile?.notes ?? 'Bao cao fallback duoc tao khi AI service khong phan hoi hop le.'
+        sourceList.length > 0 ? `Nguồn dữ liệu: ${sourceList.join(', ')}` : 'Nguồn dữ liệu chưa đầy đủ.',
+        input.cleanedProfile?.notes ?? 'Báo cáo fallback được tạo khi dịch vụ AI không phản hồi hợp lệ.'
       ]
     };
+
+    const industryNormalized = this.inferIndustryFromText(input.prospect.companyIndustry);
+    if (industryNormalized) {
+      reportJson.industry_normalized = industryNormalized;
+      reportJson.industry_confidence = 0.3;
+    }
 
     return {
       reportJson,
       reportMarkdown: this.renderProspectCompanyReportMarkdown(reportJson),
-      confidenceScore
+      confidenceScore,
+      industryNormalized,
+      industryConfidence: industryNormalized ? 0.3 : null
     };
   }
 
@@ -712,55 +901,174 @@ export class OpenAiClient {
       buying_signals: this.readStringArray(raw.buying_signals, fallback.buying_signals),
       risks: this.readStringArray(raw.risks, fallback.risks),
       recommended_next_steps: this.readStringArray(raw.recommended_next_steps, fallback.recommended_next_steps),
+      outreach_hooks: this.normalizeOutreachHooks(raw.outreach_hooks),
+      firmographics: this.normalizeFirmographics(this.readObject(raw.firmographics)),
+      sources: this.normalizeSources(raw.sources),
       qualification_score_100:
         this.readNumber(raw.qualification_score_100, 0, 100) ??
         (typeof fallback.qualification_score_100 === 'number' ? fallback.qualification_score_100 : null),
-      data_quality_notes: this.readStringArray(raw.data_quality_notes, fallback.data_quality_notes)
+      data_quality_notes: this.readStringArray(raw.data_quality_notes, fallback.data_quality_notes),
+      industry_normalized: this.toIndustryEnum(raw.industry_normalized) ??
+        (typeof fallback.industry_normalized === 'string' ? fallback.industry_normalized : null),
+      industry_confidence:
+        this.readNumber(raw.industry_confidence, 0, 1) ??
+        (typeof fallback.industry_confidence === 'number' ? fallback.industry_confidence : null)
     };
+  }
+
+  private normalizeOutreachHooks(value: unknown): Array<Record<string, unknown>> {
+    if (!Array.isArray(value)) return [];
+    const allowedUseIn = new Set(['subject', 'opener', 'follow_up']);
+    const normalized: Array<Record<string, unknown>> = [];
+
+    for (const item of value) {
+      const row = this.readObject(item);
+      if (!row) continue;
+      const hook = this.readString(row.hook);
+      if (!hook) continue;
+      const useIn = this.readString(row.use_in);
+      normalized.push({
+        hook,
+        evidence_url: this.readString(row.evidence_url),
+        use_in: useIn && allowedUseIn.has(useIn) ? useIn : 'opener'
+      });
+    }
+
+    return normalized;
+  }
+
+  private normalizeFirmographics(value: Record<string, unknown> | null): Record<string, unknown> {
+    if (!value) {
+      return {
+        employee_count_range: null,
+        revenue_range_usd: null,
+        funding_stage: null,
+        founded_year: null
+      };
+    }
+
+    const founded = typeof value.founded_year === 'number'
+      ? Math.round(value.founded_year)
+      : null;
+
+    return {
+      employee_count_range: this.readString(value.employee_count_range),
+      revenue_range_usd: this.readString(value.revenue_range_usd),
+      funding_stage: this.readString(value.funding_stage),
+      founded_year: founded !== null && founded >= 1800 && founded <= 2100 ? founded : null
+    };
+  }
+
+  private normalizeSources(value: unknown): Array<Record<string, unknown>> {
+    if (!Array.isArray(value)) return [];
+    const normalized: Array<Record<string, unknown>> = [];
+
+    for (const item of value) {
+      const row = this.readObject(item);
+      if (!row) continue;
+      const url = this.readString(row.url);
+      if (!url || !/^https?:\/\//i.test(url)) continue;
+      normalized.push({
+        url,
+        title: this.readString(row.title),
+        claim_supported: this.readString(row.claim_supported)
+      });
+    }
+
+    return normalized;
   }
 
   private renderProspectCompanyReportMarkdown(report: Record<string, unknown>): string {
     const company = (report.company_overview as Record<string, unknown>) ?? {};
     const keyPerson = (report.key_person as Record<string, unknown>) ?? {};
     const allKeyPersons = Array.isArray(report.all_key_persons) ? report.all_key_persons : [];
+    const firmographics = (report.firmographics as Record<string, unknown>) ?? {};
+    const outreachHooks = Array.isArray(report.outreach_hooks) ? report.outreach_hooks : [];
+    const sources = Array.isArray(report.sources) ? report.sources : [];
+    const industryNormalized = report.industry_normalized;
+    const industryConfidence = report.industry_confidence;
     const lines = [
-      `# Bao Cao Tong Hop Cong Ty: ${String(company.name ?? 'N/A')}`,
+      `# Báo cáo tổng hợp công ty: ${String(company.name ?? 'N/A')}`,
       '',
-      '## Executive Summary',
+      '## Tóm tắt điều hành',
       String(report.executive_summary ?? 'N/A'),
       '',
-      '## Company Overview',
-      `- Domain: ${String(company.domain ?? 'N/A')}`,
-      `- Industry: ${String(company.industry ?? 'N/A')}`,
-      `- Region: ${String(company.region ?? 'N/A')}`,
-      `- Summary: ${String(company.summary ?? 'N/A')}`,
+      '## Tổng quan công ty',
+      `- Tên miền: ${String(company.domain ?? 'N/A')}`,
+      `- Ngành: ${String(company.industry ?? 'N/A')}`,
+      `- Khu vực: ${String(company.region ?? 'N/A')}`,
+      `- Mô tả ngắn: ${String(company.summary ?? 'N/A')}`,
+      `- Phân loại ngành chuẩn hóa: ${String(industryNormalized ?? 'N/A')}${
+        typeof industryConfidence === 'number' ? ` (độ tin cậy ${industryConfidence.toFixed(2)})` : ''
+      }`,
       '',
-      '## Key Person',
-      `- Name: ${String(keyPerson.name ?? 'N/A')}`,
-      `- Title: ${String(keyPerson.title ?? 'N/A')}`,
+      '## Firmographics',
+      `- Quy mô nhân sự: ${String(firmographics.employee_count_range ?? 'N/A')}`,
+      `- Doanh thu (USD): ${String(firmographics.revenue_range_usd ?? 'N/A')}`,
+      `- Giai đoạn vốn: ${String(firmographics.funding_stage ?? 'N/A')}`,
+      `- Năm thành lập: ${String(firmographics.founded_year ?? 'N/A')}`,
+      '',
+      '## Người liên hệ chính',
+      `- Họ tên: ${String(keyPerson.name ?? 'N/A')}`,
+      `- Chức danh: ${String(keyPerson.title ?? 'N/A')}`,
       `- Email: ${String(keyPerson.email ?? 'N/A')}`,
-      `- Phone: ${String(keyPerson.phone ?? 'N/A')}`,
+      `- Điện thoại: ${String(keyPerson.phone ?? 'N/A')}`,
       `- LinkedIn: ${String(keyPerson.linkedin ?? 'N/A')}`,
       '',
-      '## All Key Persons',
+      '## Toàn bộ người liên hệ',
       ...this.renderAllKeyPersons(allKeyPersons),
       '',
-      '## Buying Signals',
+      '## Outreach Hooks (cớ tiếp cận cụ thể)',
+      ...this.renderOutreachHooksMarkdown(outreachHooks),
+      '',
+      '## Tín hiệu mua hàng',
       ...this.renderBulletList(report.buying_signals),
       '',
-      '## Risks',
+      '## Rủi ro',
       ...this.renderBulletList(report.risks),
       '',
-      '## Recommended Next Steps',
+      '## Bước tiếp theo đề xuất',
       ...this.renderBulletList(report.recommended_next_steps),
       '',
-      '## Data Quality Notes',
+      '## Nguồn dẫn chứng',
+      ...this.renderSourcesMarkdown(sources),
+      '',
+      '## Ghi chú chất lượng dữ liệu',
       ...this.renderBulletList(report.data_quality_notes),
       '',
-      `Qualification Score (0-100): ${String(report.qualification_score_100 ?? 'N/A')}`
+      `Điểm đánh giá prospect (0-100): ${String(report.qualification_score_100 ?? 'N/A')}`
     ];
 
     return lines.join('\n');
+  }
+
+  private renderOutreachHooksMarkdown(hooks: unknown[]): string[] {
+    if (!Array.isArray(hooks) || hooks.length === 0) return ['- N/A'];
+    return hooks
+      .map((item) => this.readObject(item))
+      .filter((row): row is Record<string, unknown> => row !== null)
+      .map((row) => {
+        const hook = this.readString(row.hook) ?? 'N/A';
+        const useIn = this.readString(row.use_in) ?? 'opener';
+        const evidence = this.readString(row.evidence_url);
+        const evidenceText = evidence ? ` — nguồn: ${evidence}` : '';
+        return `- [${useIn}] ${hook}${evidenceText}`;
+      });
+  }
+
+  private renderSourcesMarkdown(sources: unknown[]): string[] {
+    if (!Array.isArray(sources) || sources.length === 0) return ['- N/A'];
+    return sources
+      .map((item) => this.readObject(item))
+      .filter((row): row is Record<string, unknown> => row !== null)
+      .map((row) => {
+        const url = this.readString(row.url) ?? '';
+        const title = this.readString(row.title);
+        const claim = this.readString(row.claim_supported);
+        const titlePart = title ? `${title} — ` : '';
+        const claimPart = claim ? ` (dẫn chứng cho: ${claim})` : '';
+        return `- ${titlePart}${url}${claimPart}`;
+      });
   }
 
   private renderBulletList(value: unknown): string[] {
@@ -835,7 +1143,7 @@ export class OpenAiClient {
         const confidence = this.readNumber(row.confidence_0_1, 0, 1);
         const source = this.readString(row.source) ?? 'N/A';
         const confidenceText = confidence === null ? 'N/A' : confidence.toFixed(2);
-        return `- ${name} | ${title} | ${email} | ${phone} | confidence=${confidenceText} | source=${source}`;
+        return `- ${name} | ${title} | ${email} | ${phone} | độ tin cậy=${confidenceText} | nguồn=${source}`;
       })
       .slice(0, 100);
   }

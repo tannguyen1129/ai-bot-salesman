@@ -73,6 +73,15 @@ export class P1EmailSendProcessor extends WorkerHost {
       : safeConfig.outboundRedirectTarget.toLowerCase();
     const redirected = actualRecipient !== intendedRecipient;
 
+    if (await this.isSuppressed(intendedRecipient)) {
+      await this.pg.query(
+        `INSERT INTO audit_logs (actor, action, entity_type, entity_id, metadata)
+         VALUES ('system', 'email.send.suppressed', 'draft', $1, $2::jsonb)`,
+        [draftId, JSON.stringify({ intendedRecipient, reason: 'in_suppression_list' })]
+      );
+      throw new Error(`recipient ${intendedRecipient} is in suppression list`);
+    }
+
     const recipientDomain = actualRecipient.split('@')[1]?.toLowerCase() ?? '';
     if (!safeConfig.smtpAllowlistDomains.includes(recipientDomain)) {
       await this.pg.query(
@@ -163,6 +172,24 @@ export class P1EmailSendProcessor extends WorkerHost {
     );
 
     this.logger.log(`Draft sent via SMTP: draft=${draftId} intended=${intendedRecipient} actual=${actualRecipient}`);
+  }
+
+  private async isSuppressed(email: string): Promise<boolean> {
+    const normalized = (email ?? '').toLowerCase().trim();
+    if (!normalized || normalized === 'unknown@invalid.local') return false;
+    try {
+      const rows = await this.pg.query<{ email: string }>(
+        `SELECT email FROM email_suppression
+         WHERE email = $1
+           AND (suppressed_until IS NULL OR suppressed_until > now())
+         LIMIT 1`,
+        [normalized]
+      );
+      return rows.length > 0;
+    } catch (error) {
+      if ((error as { code?: string })?.code === '42P01') return false;
+      throw error;
+    }
   }
 
   private async resolveSafeModeConfig(): Promise<{

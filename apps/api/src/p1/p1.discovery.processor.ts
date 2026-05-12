@@ -12,6 +12,7 @@ import {
 } from '../integrations/rapid-linkedin.client';
 import { ApolloClient, ApolloCompanyCandidate, ApolloPersonCandidate } from '../integrations/apollo.client';
 import { CompanyCrawlerClient, CrawledCompanyData } from '../integrations/company-crawler.client';
+import { CompanyAliasResult, OpenAiClient } from '../integrations/openai.client';
 
 interface P1DiscoveryPayload {
   searchJobId: string;
@@ -70,6 +71,7 @@ export class P1DiscoveryProcessor extends WorkerHost {
     private readonly hunter: HunterClient,
     private readonly apollo: ApolloClient,
     private readonly crawler: CompanyCrawlerClient,
+    private readonly openAi: OpenAiClient,
     @InjectQueue('p1-sheets-sync') private readonly syncQueue: Queue
   ) {
     super();
@@ -99,7 +101,30 @@ export class P1DiscoveryProcessor extends WorkerHost {
 
     try {
       const companyQuery = this.buildCompanyQuery(searchJob);
-      const prioritizedCompanies = this.buildDiscoveryCompanies(companyQuery, []).slice(0, 3);
+      const userKeyword = (searchJob.keyword ?? '').trim();
+      const aliasResult = await this.resolveCompanyAliasesWithCache(
+        searchJobId,
+        userKeyword,
+        searchJob.region
+      );
+      const candidateNames = this.buildCandidateNameList(userKeyword, aliasResult);
+      this.logger.log(
+        `P1 discovery candidates for job=${searchJobId} query="${companyQuery}": ${JSON.stringify(candidateNames)}`
+      );
+      const prioritizedCompanies = candidateNames
+        .map<LinkedinCompanyCandidate>((name, index) => ({
+          name,
+          domain: null,
+          linkedinUrl: null,
+          industry: null,
+          region: searchJob.region,
+          employeeEstimate: null,
+          raw: {
+            provider: index === 0 ? 'user_query' : 'ai_alias',
+            queryOrigin: index === 0 ? companyQuery : aliasResult.canonical ?? companyQuery
+          }
+        }))
+        .slice(0, 3);
 
       let prospectsCreated = 0;
       let keyPersonsProcessed = 0;
@@ -211,6 +236,65 @@ export class P1DiscoveryProcessor extends WorkerHost {
     }
 
     return rows[0];
+  }
+
+  private buildCandidateNameList(userQuery: string, aliasResult: CompanyAliasResult): string[] {
+    const ordered: string[] = [];
+    const seen = new Set<string>();
+    const push = (name: string | null | undefined) => {
+      if (!name) return;
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      const key = trimmed.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      ordered.push(trimmed);
+    };
+
+    push(userQuery);
+    push(aliasResult.canonical);
+    for (const alias of aliasResult.aliases) push(alias);
+    return ordered;
+  }
+
+  private async resolveCompanyAliasesWithCache(
+    searchJobId: string,
+    query: string,
+    region: string | null
+  ): Promise<CompanyAliasResult> {
+    if (!query.trim()) return { canonical: null, aliases: [], provider: 'fallback' };
+    const ttlHours = Math.max(1, Number(process.env.AI_ALIAS_CACHE_TTL_HOURS ?? 24 * 30));
+    const requestHash = this.hashPayload({ query: query.trim().toLowerCase(), region: (region ?? '').toLowerCase() });
+
+    const cached = await this.pg.query<RawSnapshotRow>(
+      `SELECT raw_json
+       FROM raw_data_snapshots
+       WHERE source = 'ai-aliases'
+         AND entity_type = 'company-aliases'
+         AND content_hash = $1
+         AND created_at >= now() - ($2::text || ' hours')::interval
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [requestHash, ttlHours]
+    );
+    if (cached.length > 0 && cached[0].raw_json) {
+      const data = cached[0].raw_json as Partial<CompanyAliasResult> | null;
+      if (data && typeof data === 'object') {
+        return {
+          canonical: (data.canonical as string | null | undefined) ?? null,
+          aliases: Array.isArray(data.aliases) ? (data.aliases as string[]).filter((v) => typeof v === 'string') : [],
+          provider: (data.provider as CompanyAliasResult['provider']) ?? 'fallback'
+        };
+      }
+    }
+
+    const fresh = await this.openAi.expandCompanyAliases({ query, region });
+    await this.pg.query(
+      `INSERT INTO raw_data_snapshots (job_id, source, entity_type, entity_id, raw_json, content_hash)
+       VALUES ($1, 'ai-aliases', 'company-aliases', $2, $3::jsonb, $4)`,
+      [searchJobId, query.trim().slice(0, 200), JSON.stringify(fresh), requestHash]
+    );
+    return fresh;
   }
 
   private buildCompanyQuery(searchJob: SearchJobSnapshot): string {
